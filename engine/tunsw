@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""tunsw (TunnelSwitch) — 그룹 단위 터널 스위처. 그룹은 사용자가 만든다 (예: 회사·AWS 계정별).
+
+한 번에 한 그룹만 켜진다. 그룹 안에서는 터널을 하나씩 또는 한꺼번에 켜고 끌 수 있고,
+켜진 터널은 백그라운드 데몬이 유지하며 끊기면 다시 연결한다.
+설정은 ~/.config/tunnelswitch/config.json, 켜진 터널 목록은 desired.json 에 저장된다.
+예전 이름(DB 터널, ~/.config/dbtunnel)의 설정은 처음 실행할 때 옮겨 온다 (migrate_legacy_home).
+
+터널 방식
+  eic         EIC Endpoint 로 배스천 EC2 에 SSH 한 뒤 -L 로 RDS 포워딩
+  ssh         pem 키로 공인 배스천에 SSH 한 뒤 -L 로 RDS 포워딩
+  eic-direct  EIC open-tunnel 로 VPC 내부 IP:포트에 직접 연결 (배스천 없음)
+  web         SSH 서버를 거쳐 웹 서비스(ArgoCD·Jenkins 등)를 localhost 로 포워딩
+
+ssh·web 은 pem 키(auth=key, 기본) 또는 비밀번호(auth=password)로 인증한다.
+비밀번호는 SSH_ASKPASS 로 ssh 에 넘긴다 (config.json 은 권한 600).
+"""
+
+import argparse
+import getpass
+import json
+import logging
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("TUNSW_HOME", Path.home() / ".config" / "tunnelswitch"))
+LEGACY_HOME = Path.home() / ".config" / "dbtunnel"
+CONFIG = HOME / "config.json"
+PIDFILE = HOME / "daemon.pid"
+STATUS = HOME / "status.json"
+DESIRED = HOME / "desired.json"
+LOGFILE = HOME / "daemon.log"
+KNOWN_HOSTS = HOME / "known_hosts"
+EIC_KEY = HOME / "eic_ed25519"
+ASKPASS = HOME / "askpass.sh"
+
+LOG_MAX_BYTES = 5 * 1024 * 1024
+STABLE_SECONDS = 60
+MAX_BACKOFF = 60
+
+DEFAULT_CONFIG = {"groups": {}}
+GROUP_NAME_MAX = 30
+
+TYPES = ("eic", "ssh", "eic-direct", "web")
+SSH_TYPES = ("ssh", "web")
+AUTHS = ("key", "password")
+SCHEMES = ("http", "https")
+WEB_DEFAULT_HOST = "127.0.0.1"
+
+
+# ---------------------------------------------------------------- config
+
+def ensure_home():
+    """설정 디렉터리는 본인만 읽을 수 있게 한다 (로그에 내부 IP·엔드포인트, EIC 개인키가 있다)."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    os.chmod(HOME, 0o700)
+
+
+def load_config():
+    ensure_home()
+    if not CONFIG.exists():
+        save_config(DEFAULT_CONFIG)
+    with CONFIG.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_config(cfg):
+    write_json(CONFIG, cfg)
+    os.chmod(CONFIG, 0o600)
+
+
+def write_json(path, data):
+    ensure_home()
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def find_group_key(cfg, name):
+    """키 또는 표시 이름으로 그룹 키를 찾는다. 없으면 None"""
+    if name in cfg["groups"]:
+        return name
+    for key, group in cfg["groups"].items():
+        if group.get("label") == name:
+            return key
+    return None
+
+
+def resolve_group(cfg, name):
+    key = find_group_key(cfg, name)
+    if key is None:
+        if not cfg["groups"]:
+            die("그룹이 없습니다. 먼저 만드세요: tunsw group-add <이름>")
+        names = ", ".join(label(cfg, k) for k in cfg["groups"])
+        die(f"그룹 '{name}' 이 없습니다. 있는 그룹: {names}")
+    return key
+
+
+def get_group(cfg, name):
+    return cfg["groups"][resolve_group(cfg, name)]
+
+
+def validate_group_name(cfg, name, exclude=None):
+    """새 그룹 이름 검증. exclude: 이름을 바꾸는 중인 그룹의 키"""
+    if not name:
+        return "그룹 이름을 입력하세요."
+    if len(name) > GROUP_NAME_MAX:
+        return f"그룹 이름은 {GROUP_NAME_MAX}자 이하여야 합니다."
+    if name.startswith("-") or "/" in name:
+        return "그룹 이름은 '-' 로 시작하거나 '/' 를 포함할 수 없습니다."
+    other = find_group_key(cfg, name)
+    if other is not None and other != exclude:
+        return f"'{name}' 그룹이 이미 있습니다."
+    return None
+
+
+def label(cfg, name):
+    return cfg["groups"][name].get("label") or name
+
+
+def remote_host_of(t):
+    """web 은 대상 호스트를 비우면 SSH 서버 자신(127.0.0.1)으로 본다."""
+    if t["type"] == "web":
+        return t.get("remote_host") or WEB_DEFAULT_HOST
+    return t.get("remote_host")
+
+
+def target_of(t):
+    if t["type"] == "eic-direct":
+        return f"{t['private_ip']}:{t['remote_port']}"
+    return f"{remote_host_of(t)}:{t['remote_port']}"
+
+
+def via_of(t):
+    if t["type"] == "eic":
+        return f"eic {t['instance_id']} ({t['profile']})"
+    if t["type"] in SSH_TYPES:
+        auth = "비밀번호" if t.get("auth") == "password" else "pem"
+        return f"ssh {t['user']}@{t['host']} ({auth})"
+    return f"eic-direct {t['eice_id']} ({t['profile']})"
+
+
+def url_of(t):
+    """web 터널을 브라우저로 열 주소. 다른 방식은 None"""
+    if t["type"] != "web":
+        return None
+    return f"{t.get('scheme', 'http')}://localhost:{t['local_port']}"
+
+
+# ---------------------------------------------------------------- 대화형 입력
+
+def ask(prompt, default=None, required=True, validator=None):
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    while True:
+        try:
+            value = input(f"  {prompt}{suffix}: ").strip()
+        except EOFError:
+            die("\n입력이 중단되었습니다.")
+        if not value and default is not None:
+            value = str(default)
+        if not value:
+            if not required:
+                return None
+            print("    값을 입력하세요.")
+            continue
+        if validator:
+            error = validator(value)
+            if error:
+                print(f"    {error}")
+                continue
+        return value
+
+
+def port_validator(value):
+    if not value.isdigit() or not 1 <= int(value) <= 65535:
+        return "1~65535 사이 숫자여야 합니다."
+    return None
+
+
+def file_validator(value):
+    if not Path(value).expanduser().is_file():
+        return f"파일이 없습니다: {value}"
+    return None
+
+
+def choose(prompt, options):
+    """options: [(value, 표시문구)] → 선택된 value"""
+    for i, (_, text) in enumerate(options, 1):
+        print(f"    {i}) {text}")
+    while True:
+        raw = ask(prompt)
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][0]
+        for value, _ in options:
+            if raw == value:
+                return value
+        print("    목록의 번호를 입력하세요.")
+
+
+def choose_group(cfg, prompt="그룹"):
+    if not cfg["groups"]:
+        die("그룹이 없습니다. 먼저 만드세요: tunsw group-add <이름>")
+    options = [(k, f"{v.get('label') or k} ({k}) — 터널 {len(v['tunnels'])}개")
+               for k, v in cfg["groups"].items()]
+    return choose(prompt, options)
+
+
+# ---------------------------------------------------------------- 명령: 등록/조회
+
+def cmd_add(args):
+    if args.json:
+        if not args.group:
+            die("--json 에는 그룹을 지정해야 합니다.")
+        add_json(args)
+        return
+    cfg = load_config()
+    group_name = args.group or choose_group(cfg)
+    group = get_group(cfg, group_name)
+    print(f"[{label(cfg, group_name)}] 터널 등록 (Enter = [기본값])")
+    tunnels = group["tunnels"]
+    names = {t["name"] for t in tunnels}
+    ports = {t["local_port"]: t["name"] for t in tunnels}
+
+    def name_validator(v):
+        return f"'{v}' 는 이미 있습니다." if v in names else None
+
+    def local_port_validator(v):
+        error = port_validator(v)
+        if error:
+            return error
+        if int(v) in ports:
+            return f"로컬 포트 {v} 는 '{ports[int(v)]}' 가 쓰고 있습니다."
+        return None
+
+    t = {"name": ask("이름 (예: dev-rds)", validator=name_validator)}
+    t["type"] = choose("방식", [
+        ("eic", "eic        — EIC 로 배스천 EC2 경유 (RDS 접속용)"),
+        ("ssh", "ssh        — pem 키로 공인 배스천 경유"),
+        ("eic-direct", "eic-direct — EIC 로 내부 IP 에 직접 (배스천 없이)"),
+        ("web", "web        — SSH 경유 웹 서비스 (ArgoCD·Jenkins 등, 브라우저로 열기)"),
+    ])
+
+    def ask_ssh_login(kind):
+        t["host"] = ask(f"{kind} 호스트/IP")
+        t["user"] = ask(f"{kind} 유저", default="ec2-user")
+        t["ssh_port"] = int(ask("SSH 포트", default=22, validator=port_validator))
+        t["auth"] = choose("인증", [("key", "pem 키"), ("password", "비밀번호")])
+        if t["auth"] == "key":
+            t["key"] = str(Path(ask("pem 키 경로", validator=file_validator)).expanduser().resolve())
+        else:
+            t["password"] = ask_password()
+
+    if t["type"] == "eic":
+        t["instance_id"] = ask("배스천 인스턴스 ID (i-...)")
+        t["profile"] = ask("AWS 프로파일")
+        t["os_user"] = ask("배스천 OS 유저", default="ec2-user")
+        t["region"] = ask("리전 (비우면 프로파일 설정)", default="", required=False)
+        t["eice_id"] = ask("EIC Endpoint ID (비우면 자동 탐색)", default="", required=False)
+        t["remote_host"] = ask("RDS 엔드포인트")
+        t["remote_port"] = int(ask("RDS 포트", default=3306, validator=port_validator))
+    elif t["type"] == "ssh":
+        ask_ssh_login("배스천")
+        t["remote_host"] = ask("RDS 엔드포인트")
+        t["remote_port"] = int(ask("RDS 포트", default=3306, validator=port_validator))
+    elif t["type"] == "web":
+        ask_ssh_login("SSH 서버")
+        t["remote_host"] = ask("서비스 호스트 (SSH 서버에서 본 주소)", default=WEB_DEFAULT_HOST)
+        t["remote_port"] = int(ask("서비스 포트", default=8080, validator=port_validator))
+        t["scheme"] = choose("프로토콜", [("http", "http"), ("https", "https")])
+    else:
+        t["eice_id"] = ask("EIC Endpoint ID (eice-...)")
+        t["profile"] = ask("AWS 프로파일")
+        t["region"] = ask("리전 (비우면 프로파일 설정)", default="", required=False)
+        t["private_ip"] = ask("대상 내부 IP")
+        t["remote_port"] = int(ask("대상 포트", default=3306, validator=port_validator))
+
+    client = "브라우저" if t["type"] == "web" else "DataGrip"
+    t["local_port"] = int(ask(f"로컬 포트 ({client} 에서 접속할 포트)", validator=local_port_validator))
+    t = {k: v for k, v in t.items() if v not in (None, "")}
+
+    tunnels.append(t)
+    save_config(cfg)
+    print(f"\n등록됨: [{label(cfg, group_name)}] {t['name']}  "
+          f"127.0.0.1:{t['local_port']} → {target_of(t)}  via {via_of(t)}")
+    if url_of(t):
+        print(f"브라우저: {url_of(t)}")
+
+
+def ask_password():
+    while True:
+        try:
+            value = getpass.getpass("  SSH 비밀번호: ")
+        except EOFError:
+            die("\n입력이 중단되었습니다.")
+        if value:
+            return value
+        print("    값을 입력하세요.")
+
+
+REQUIRED = {
+    "eic": ("instance_id", "profile", "remote_host", "remote_port"),
+    "ssh": ("host", "user", "remote_host", "remote_port"),
+    "eic-direct": ("eice_id", "profile", "private_ip", "remote_port"),
+    "web": ("host", "user", "remote_port"),
+}
+PORT_FIELDS = ("local_port", "remote_port", "ssh_port")
+
+
+def validate_tunnel(t, others):
+    """문제가 있으면 메시지를, 없으면 None 을 반환한다. others: 같은 그룹의 나머지 터널"""
+    if not t.get("name"):
+        return "이름을 입력하세요."
+    if t.get("type") not in TYPES:
+        return "방식을 선택하세요."
+    missing = [f for f in REQUIRED[t["type"]] + ("local_port",) if t.get(f) in (None, "")]
+    if missing:
+        return "필수 항목이 비었습니다: " + ", ".join(missing)
+    for f in PORT_FIELDS:
+        if f in t and not (isinstance(t[f], int) and 1 <= t[f] <= 65535):
+            return f"{f} 는 1~65535 사이 숫자여야 합니다."
+    if t["type"] in SSH_TYPES:
+        auth = t.get("auth", "key")
+        if auth not in AUTHS:
+            return "인증 방식은 key 또는 password 여야 합니다."
+        if auth == "key":
+            if not t.get("key"):
+                return "pem 키 경로를 입력하세요."
+            if not Path(t["key"]).expanduser().is_file():
+                return f"pem 키 파일이 없습니다: {t['key']}"
+        elif not t.get("password"):
+            return "SSH 비밀번호를 입력하세요."
+    if t["type"] == "web" and t.get("scheme", "http") not in SCHEMES:
+        return "프로토콜은 http 또는 https 여야 합니다."
+    for o in others:
+        if o["name"] == t["name"]:
+            return f"'{t['name']}' 이름이 이미 있습니다."
+        if o["local_port"] == t["local_port"]:
+            return f"로컬 포트 {t['local_port']} 는 '{o['name']}' 가 쓰고 있습니다."
+    return None
+
+
+def add_json(args):
+    cfg = load_config()
+    group = get_group(cfg, args.group)
+    try:
+        t = json.loads(args.json)
+    except json.JSONDecodeError as e:
+        die(f"JSON 오류: {e}")
+    t = {k: v for k, v in t.items() if v not in (None, "")}
+    if t.get("key"):
+        t["key"] = str(Path(t["key"]).expanduser())
+    replace = args.replace
+    if replace and not any(o["name"] == replace for o in group["tunnels"]):
+        die(f"'{replace}' 터널이 없습니다.")
+    others = [o for o in group["tunnels"] if o["name"] != replace]
+    error = validate_tunnel(t, others)
+    if error:
+        die(error)
+    if replace:
+        group["tunnels"] = [t if o["name"] == replace else o for o in group["tunnels"]]
+    else:
+        group["tunnels"].append(t)
+    save_config(cfg)
+
+
+def status_json():
+    cfg = load_config()
+    running = daemon_group()
+    try:
+        status = json.loads(STATUS.read_text()) if running else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        status = {}
+    listeners = listening_pids() if running else {}
+    enabled = enabled_names(running) if running else set()
+    groups = []
+    for key, group in cfg["groups"].items():
+        tunnels = []
+        for t in group["tunnels"]:
+            s = status.get("tunnels", {}).get(t["name"], {})
+            on = key == running and t["name"] in enabled
+            state = tunnel_state(t, s, listeners) if on else "off"
+            tunnels.append({
+                "config": t, "target": target_of(t), "via": via_of(t), "url": url_of(t),
+                "enabled": on, "state": state,
+                "restarts": s.get("restarts", 0), "last_error": s.get("last_error"),
+            })
+        groups.append({"key": key, "label": group.get("label") or key, "tunnels": tunnels})
+    print(json.dumps({"running": running, "groups": groups, "log": str(LOGFILE)},
+                     ensure_ascii=False))
+
+
+def cmd_list(args):
+    cfg = load_config()
+    names = [args.group] if args.group else list(cfg["groups"])
+    active = daemon_group()
+    for name in names:
+        group = get_group(cfg, name)
+        mark = "  ← 실행 중" if name == active else ""
+        print(f"[{group.get('label') or name}] ({name}){mark}")
+        if not group["tunnels"]:
+            print("  (등록된 터널 없음 — tunsw add)")
+        for t in group["tunnels"]:
+            print(f"  {t['name']:<22} 127.0.0.1:{t['local_port']:<6} → {target_of(t)}")
+            print(f"  {'':<22} via {via_of(t)}")
+            if url_of(t):
+                print(f"  {'':<22} 브라우저 {url_of(t)}")
+        print()
+
+
+def cmd_remove(args):
+    cfg = load_config()
+    group = get_group(cfg, args.group)
+    before = len(group["tunnels"])
+    group["tunnels"] = [t for t in group["tunnels"] if t["name"] != args.name]
+    if len(group["tunnels"]) == before:
+        die(f"'{args.group}' 그룹에 '{args.name}' 터널이 없습니다.")
+    save_config(cfg)
+    print(f"삭제됨: {args.group}/{args.name}")
+
+
+def cmd_group_add(args):
+    cfg = load_config()
+    name = args.name.strip()
+    error = validate_group_name(cfg, name)
+    if error:
+        die(error)
+    cfg["groups"][name] = {"label": name, "tunnels": []}
+    save_config(cfg)
+    print(f"그룹 추가됨: {name}")
+
+
+def cmd_group_rename(args):
+    """표시 이름만 바꾼다. 키는 그대로라 켜진 터널과 CLI 에서 쓰던 이름이 유지된다."""
+    cfg = load_config()
+    key = resolve_group(cfg, args.group)
+    name = args.new_name.strip()
+    error = validate_group_name(cfg, name, exclude=key)
+    if error:
+        die(error)
+    cfg["groups"][key]["label"] = name
+    save_config(cfg)
+    print(f"그룹 이름 변경: {args.group} → {name}")
+
+
+def cmd_group_remove(args):
+    cfg = load_config()
+    key = resolve_group(cfg, args.group)
+    count = len(cfg["groups"][key]["tunnels"])
+    if count and not args.force:
+        die(f"'{label(cfg, key)}' 에 터널 {count}개가 있습니다. 함께 지우려면 --force")
+    name = label(cfg, key)
+    if daemon_group() == key:
+        stop_daemon()
+        write_desired(None, [])
+    del cfg["groups"][key]
+    save_config(cfg)
+    print(f"그룹 삭제됨: {name}")
+
+
+def cmd_edit(_args):
+    load_config()
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, str(CONFIG)])
+    try:
+        load_config()
+    except json.JSONDecodeError as e:
+        die(f"config.json 문법 오류: {e}")
+
+
+# ---------------------------------------------------------------- 명령: 실행 제어
+
+def read_pid():
+    try:
+        pid = int(PIDFILE.read_text().split()[0])
+    except (FileNotFoundError, ValueError, IndexError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    return pid
+
+
+def daemon_group():
+    if read_pid() is None:
+        return None
+    try:
+        return PIDFILE.read_text().split()[1]
+    except IndexError:
+        return None
+
+
+def read_desired():
+    """켜져 있어야 할 터널 목록. 데몬이 1초마다 읽어 실제 상태를 맞춘다."""
+    try:
+        d = json.loads(DESIRED.read_text())
+        return {"group": d.get("group"), "tunnels": list(d.get("tunnels", []))}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"group": None, "tunnels": []}
+
+
+def write_desired(group_name, names):
+    write_json(DESIRED, {"group": group_name, "tunnels": sorted(names)})
+
+
+def resolve_names(cfg, group_name, names):
+    group = get_group(cfg, group_name)
+    all_names = [t["name"] for t in group["tunnels"]]
+    if not all_names:
+        die(f"[{label(cfg, group_name)}] 에 등록된 터널이 없습니다. 먼저: tunsw add '{label(cfg, group_name)}'")
+    unknown = [n for n in names if n not in all_names]
+    if unknown:
+        die(f"[{label(cfg, group_name)}] 에 없는 터널: {', '.join(unknown)}")
+    return names or all_names
+
+
+def turn_on(group_name, names):
+    """터널을 켠다(names 가 비면 그룹 전체). 다른 그룹이 켜져 있으면 그 그룹은 꺼진다."""
+    cfg = load_config()
+    targets = resolve_names(cfg, group_name, names)
+    running = daemon_group()
+    desired = read_desired()
+    on = set(targets)
+    if running == group_name and desired["group"] == group_name:
+        on |= set(desired["tunnels"])
+    write_desired(group_name, on)
+    if running != group_name:
+        if running:
+            stop_daemon()
+        start_daemon(group_name)
+    print(f"[{label(cfg, group_name)}] 켬: {', '.join(sorted(targets))}")
+
+
+def turn_off(group_name, names):
+    """터널을 끈다(names 가 비면 그룹 전체). 남은 터널이 없으면 데몬을 멈춘다."""
+    cfg = load_config()
+    targets = resolve_names(cfg, group_name, names)
+    if daemon_group() != group_name:
+        print(f"[{label(cfg, group_name)}] 은 꺼져 있습니다.")
+        return
+    remaining = set(read_desired()["tunnels"]) - set(targets)
+    write_desired(group_name, remaining)
+    if not remaining:
+        stop_daemon()
+    print(f"[{label(cfg, group_name)}] 끔: {', '.join(sorted(targets))}")
+
+
+def cmd_on(args):
+    turn_on(args.group, args.names)
+
+
+def cmd_off(args):
+    turn_off(args.group, args.names)
+
+
+def cmd_use(args):
+    cfg = load_config()
+    turn_on(args.group or choose_group(cfg, "켤 그룹"), [])
+
+
+def cmd_open(args):
+    """web 터널을 (꺼져 있으면 켜고) 브라우저로 연다."""
+    cfg = load_config()
+    t = next((t for t in get_group(cfg, args.group)["tunnels"] if t["name"] == args.name), None)
+    if t is None:
+        die(f"[{label(cfg, args.group)}] 에 없는 터널: {args.name}")
+    url = url_of(t)
+    if not url:
+        die(f"'{args.name}' 은 웹 터널이 아닙니다.")
+    if args.name not in enabled_names(args.group):
+        turn_on(args.group, [args.name])
+    for _ in range(100):  # 연결될 때까지 최대 20초 기다린다
+        if t["local_port"] in listening_pids():
+            break
+        time.sleep(0.2)
+    else:
+        die(f"'{args.name}' 이 20초 안에 연결되지 않았습니다. 로그: tunsw logs")
+    subprocess.call(["open", url])
+
+
+def cmd_restart(_args):
+    group_name = daemon_group()
+    if not group_name:
+        die("켜진 터널이 없습니다.")
+    stop_daemon()
+    start_daemon(group_name)
+    print("재시작했습니다.")
+
+
+def cmd_stop(_args):
+    desired = read_desired()
+    if not stop_daemon():
+        print("실행 중인 터널이 없습니다.")
+        return
+    write_desired(desired["group"], [])
+    print("터널을 모두 껐습니다.")
+
+
+def start_daemon(group_name):
+    ensure_home()
+    if LOGFILE.exists() and LOGFILE.stat().st_size > LOG_MAX_BYTES:
+        LOGFILE.replace(LOGFILE.with_suffix(".log.1"))
+    with open(os.devnull, "rb") as devnull, LOGFILE.open("ab") as log:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "_daemon", group_name],
+            stdin=devnull, stdout=log, stderr=log,
+            start_new_session=True, close_fds=True,
+        )
+    for _ in range(30):
+        if read_pid():
+            return
+        time.sleep(0.1)
+    die(f"데몬 시작 실패. 로그: {LOGFILE}")
+
+
+def stop_daemon():
+    pid = read_pid()
+    if pid is None:
+        kill_orphans()
+        PIDFILE.unlink(missing_ok=True)
+        return False
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if read_pid() is None:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)
+    kill_orphans()
+    PIDFILE.unlink(missing_ok=True)
+    STATUS.unlink(missing_ok=True)
+    return True
+
+
+def kill_orphans():
+    """데몬이 강제 종료돼 남은 터널 프로세스 그룹을 정리한다."""
+    try:
+        status = json.loads(STATUS.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    for s in status.get("tunnels", {}).values():
+        if s.get("pgid"):
+            try:
+                os.killpg(s["pgid"], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+STATE_TEXT = {"connected": "● 연결됨", "port_conflict": "⚠ 포트 점유",
+              "connecting": "○ 연결 중", "off": "  꺼짐  "}
+
+
+def enabled_names(group_name):
+    """group_name 에서 지금 켜져 있어야 하는 터널 이름 집합 (데몬이 없으면 빈 집합)"""
+    desired = read_desired()
+    if daemon_group() != group_name or desired["group"] != group_name:
+        return set()
+    return set(desired["tunnels"])
+
+
+def listening_pids():
+    """{로컬 포트: LISTEN 중인 pid 집합}.
+
+    포트에 직접 접속해 확인하면 그 접속이 터널을 타고 원격까지 전달되므로(EIC 웹소켓 생성,
+    RDS 접속 시도) 소켓 목록만 조회한다. 권한상 현재 사용자 프로세스만 보인다.
+    """
+    try:
+        out = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    result, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            port = line.rsplit(":", 1)[-1]
+            if port.isdigit():
+                result.setdefault(int(port), set()).add(pid)
+    return result
+
+
+def tunnel_state(t, s, listeners):
+    """connected: 데몬이 띄운 터널 프로세스가 LISTEN 중 / port_conflict: 다른 프로세스가 점유"""
+    pids = listeners.get(t["local_port"], set())
+    pgid = s.get("pgid")
+    if pgid and any(safe_getpgid(p) == pgid for p in pids):
+        return "connected"
+    if pids:
+        return "port_conflict"
+    return "connecting"
+
+
+def safe_getpgid(pid):
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return None
+
+
+def cmd_status(args):
+    if args.json:
+        status_json()
+        return
+    cfg = load_config()
+    group_name = daemon_group()
+    if group_name is None:
+        print("꺼져 있음. 켜기: tunsw use")
+        return
+    try:
+        status = json.loads(STATUS.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        status = {"tunnels": {}}
+    print(f"[{label(cfg, group_name)}] 실행 중 (pid {read_pid()})\n")
+    listeners = listening_pids()
+    enabled = enabled_names(group_name)
+    for t in get_group(cfg, group_name)["tunnels"]:
+        s = status["tunnels"].get(t["name"], {})
+        state = STATE_TEXT[tunnel_state(t, s, listeners) if t["name"] in enabled else "off"]
+        print(f"  {state}  {t['name']:<22} 127.0.0.1:{t['local_port']:<6} → {target_of(t)}"
+              f"  (재연결 {s.get('restarts', 0)}회)")
+        if s.get("last_error") and state not in (STATE_TEXT["connected"], STATE_TEXT["off"]):
+            print(f"           최근 오류: {s['last_error']}")
+    print(f"\n로그: tunsw logs -f")
+
+
+def cmd_logs(args):
+    if not LOGFILE.exists():
+        print("로그가 없습니다.")
+        return
+    cmd = ["tail", "-n", str(args.lines)] + (["-f"] if args.follow else []) + [str(LOGFILE)]
+    try:
+        subprocess.call(cmd)
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------- 데몬
+
+class Supervisor:
+    """desired.json 을 1초마다 읽어 터널별 Worker 를 시작·중지한다.
+
+    켜진 터널의 설정이 바뀌면 그 터널만 다시 연결한다.
+    """
+
+    def __init__(self, group_name):
+        self.group_name = group_name
+        self.aws = shutil.which("aws") or "aws"
+        self.stopping = threading.Event()
+        self.status_lock = threading.Lock()
+        self.status = {"group": group_name, "tunnels": {}}
+        self.workers = {}
+        self.config_error = None
+
+    def run(self):
+        PIDFILE.write_text(f"{os.getpid()} {self.group_name}\n")
+        signal.signal(signal.SIGTERM, self.handle_stop)
+        signal.signal(signal.SIGINT, self.handle_stop)
+        logging.info("=== 시작: %s", self.group_name)
+        while not self.stopping.is_set():
+            self.reconcile()
+            self.stopping.wait(1)
+        for w in self.workers.values():
+            w.stop()
+        for w in self.workers.values():
+            w.thread.join(timeout=5)
+        STATUS.unlink(missing_ok=True)
+        PIDFILE.unlink(missing_ok=True)
+        logging.info("=== 종료: %s", self.group_name)
+
+    def handle_stop(self, _signum, _frame):
+        self.stopping.set()
+
+    def reconcile(self):
+        try:
+            cfg = load_config()
+        except (OSError, json.JSONDecodeError) as e:
+            if str(e) != self.config_error:
+                logging.error("config.json 을 읽지 못해 현재 상태를 유지합니다: %s", e)
+                self.config_error = str(e)
+            return
+        self.config_error = None
+        group = cfg["groups"].get(self.group_name, {"tunnels": []})
+        defs = {t["name"]: t for t in group["tunnels"]}
+        desired = read_desired()
+        want = set(desired["tunnels"]) if desired["group"] == self.group_name else set()
+        want &= set(defs)
+
+        for name in list(self.workers):
+            w = self.workers[name]
+            if name in want and w.t == defs[name]:
+                continue
+            logging.info("[%s] %s", name, "설정 변경 — 다시 연결" if name in want else "끔")
+            w.stop()
+            w.thread.join(timeout=5)
+            del self.workers[name]
+            self.remove_status(name)
+
+        for name in sorted(want - set(self.workers)):
+            t = defs[name]
+            if t["type"] == "eic":
+                ensure_eic_key()
+            if t.get("auth") == "password":
+                ensure_askpass()
+            w = Worker(self, t)
+            self.workers[name] = w
+            w.thread.start()
+
+    def update_status(self, name, **fields):
+        with self.status_lock:
+            self.status["tunnels"].setdefault(name, {"restarts": 0}).update(fields)
+            write_json(STATUS, self.status)
+
+    def remove_status(self, name):
+        with self.status_lock:
+            self.status["tunnels"].pop(name, None)
+            write_json(STATUS, self.status)
+
+    def aws_common(self, t):
+        args = ["--profile", t["profile"]]
+        if t.get("region"):
+            args += ["--region", t["region"]]
+        return args
+
+    def push_eic_key(self, t):
+        cmd = [self.aws, "ec2-instance-connect", "send-ssh-public-key",
+               "--instance-id", t["instance_id"],
+               "--instance-os-user", t.get("os_user", "ec2-user"),
+               "--ssh-public-key", f"file://{EIC_KEY}.pub"] + self.aws_common(t)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise TunnelError("send-ssh-public-key 시간 초과")
+        if r.returncode != 0:
+            raise TunnelError("send-ssh-public-key 실패: " + last_nonempty(r.stderr))
+
+    def build_command(self, t):
+        forward = f"127.0.0.1:{t['local_port']}:{remote_host_of(t)}:{t['remote_port']}"
+        password = t.get("auth") == "password"
+        ssh_opts = [
+            "-N", "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        ]
+        if password:
+            # 비밀번호는 SSH_ASKPASS 로 넘긴다 (build_env). 틀리면 한 번만 시도하고 끊는다.
+            ssh_opts += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
+                         "-o", "PreferredAuthentications=password,keyboard-interactive",
+                         "-o", "NumberOfPasswordPrompts=1"]
+        else:
+            ssh_opts += ["-o", "BatchMode=yes"]
+        if t["type"] == "eic":
+            proxy = [self.aws, "ec2-instance-connect", "open-tunnel",
+                     "--instance-id", t["instance_id"]] + self.aws_common(t)
+            if t.get("eice_id"):
+                proxy += ["--instance-connect-endpoint-id", t["eice_id"]]
+            return ["ssh"] + ssh_opts + [
+                "-i", str(EIC_KEY),
+                "-o", "ProxyCommand=" + " ".join(sh_quote(a) for a in proxy),
+                "-L", forward,
+                f"{t.get('os_user', 'ec2-user')}@{t['instance_id']}",
+            ]
+        if t["type"] in SSH_TYPES:
+            identity = [] if password else ["-i", t["key"]]
+            return ["ssh"] + ssh_opts + identity + [
+                "-p", str(t.get("ssh_port", 22)),
+                "-L", forward, f"{t['user']}@{t['host']}",
+            ]
+        if t["type"] == "eic-direct":
+            return [self.aws, "ec2-instance-connect", "open-tunnel",
+                    "--instance-connect-endpoint-id", t["eice_id"],
+                    "--private-ip-address", t["private_ip"],
+                    "--remote-port", str(t["remote_port"]),
+                    "--local-port", str(t["local_port"])] + self.aws_common(t)
+        raise TunnelError(f"알 수 없는 방식: {t['type']}")
+
+    def build_env(self, t):
+        """비밀번호 인증이면 ssh 가 tty 없이 askpass 스크립트로 비밀번호를 읽게 한다."""
+        if t.get("auth") != "password":
+            return None
+        env = dict(os.environ)
+        env.update(SSH_ASKPASS=str(ASKPASS), SSH_ASKPASS_REQUIRE="force",
+                   TUNSW_SSH_PASSWORD=t["password"])
+        return env
+
+
+class Worker:
+    """터널 하나. 끊기면 백오프하며 다시 연결하고, stop() 하면 프로세스 그룹째 종료한다."""
+
+    def __init__(self, sup, t):
+        self.sup = sup
+        self.t = t
+        self.name = t["name"]
+        self.stop_event = threading.Event()
+        self.proc = None
+        self.proc_lock = threading.Lock()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def stop(self):
+        self.stop_event.set()
+        with self.proc_lock:
+            proc = self.proc
+        if proc:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def loop(self):
+        failures = 0
+        attempts = 0
+        self.sup.update_status(self.name, restarts=0, pgid=None, last_error=None)
+        while not self.stop_event.is_set():
+            if attempts:
+                self.sup.update_status(self.name, restarts=attempts)
+            attempts += 1
+            started = time.monotonic()
+            error = self.run_once()
+            if self.stop_event.is_set():
+                break
+            if time.monotonic() - started >= STABLE_SECONDS:
+                failures = 0
+            failures += 1
+            delay = min(MAX_BACKOFF, 2 ** failures)
+            self.sup.update_status(self.name, pgid=None, last_error=error)
+            logging.warning("[%s] 끊김 (%s) — %d초 후 재연결", self.name, error, delay)
+            self.stop_event.wait(delay)
+
+    def run_once(self):
+        """터널을 띄우고 종료될 때까지 기다린다. 종료 사유를 반환한다."""
+        t = self.t
+        if not port_free(t["local_port"]):
+            return f"로컬 포트 {t['local_port']} 가 이미 사용 중"
+        try:
+            if t["type"] == "eic":
+                self.sup.push_eic_key(t)
+            cmd = self.sup.build_command(t)
+            env = self.sup.build_env(t)
+        except TunnelError as e:
+            return str(e)
+
+        logging.info("[%s] 연결 시도 127.0.0.1:%d → %s", self.name, t["local_port"], target_of(t))
+        with self.proc_lock:
+            if self.stop_event.is_set():
+                return "중지됨"
+            proc = self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=env,
+                stderr=subprocess.STDOUT, start_new_session=True, text=True, errors="replace")
+        self.sup.update_status(self.name, pgid=proc.pid, last_error=None)
+        last_line = None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                last_line = line
+                logging.info("[%s] %s", self.name, line)
+        code = proc.wait()
+        with self.proc_lock:
+            self.proc = None
+        return last_line or f"종료 코드 {code}"
+
+
+class TunnelError(Exception):
+    pass
+
+
+def ensure_eic_key():
+    if EIC_KEY.exists():
+        return
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                    "-C", "tunsw-eic", "-f", str(EIC_KEY)], check=True)
+    logging.info("EIC 용 임시 SSH 키 생성: %s", EIC_KEY)
+
+
+def ensure_askpass():
+    """비밀번호를 환경변수에서 읽어 출력하는 SSH_ASKPASS 스크립트. 비밀번호 자체는 담지 않는다."""
+    script = '#!/bin/sh\nprintf \'%s\\n\' "$TUNSW_SSH_PASSWORD"\n'
+    if ASKPASS.exists() and ASKPASS.read_text() == script:
+        return
+    ASKPASS.write_text(script)
+    os.chmod(ASKPASS, 0o700)
+
+
+def port_free(port):
+    """다른 프로세스가 LISTEN 중이 아니면 True.
+
+    ssh·aws open-tunnel 처럼 SO_REUSEADDR 로 검사해야 끊긴 연결의 잔재(클라이언트가
+    CLOSE_WAIT 로 쥐고 있는 소켓 등)를 사용 중으로 오판하지 않는다.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def last_nonempty(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return lines[-1] if lines else "(메시지 없음)"
+
+
+def sh_quote(s):
+    return s if s and all(c.isalnum() or c in "-_./:=@" for c in s) else "'" + s.replace("'", "'\\''") + "'"
+
+
+def migrate_legacy_home():
+    """예전 설정 폴더(~/.config/dbtunnel)를 새 위치로 옮긴다. 켜져 있던 터널은 새 데몬으로 다시 켠다.
+
+    예전 데몬은 예전 폴더에 pid·상태 파일을 쓰므로 먼저 멈춘 뒤 옮긴다.
+    """
+    if "TUNSW_HOME" in os.environ or HOME.exists() or not LEGACY_HOME.is_dir():
+        return
+    try:
+        pid = int((LEGACY_HOME / "daemon.pid").read_text().split()[0])
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            os.kill(pid, 0)
+            time.sleep(0.1)
+        os.kill(pid, signal.SIGKILL)
+    except (FileNotFoundError, ValueError, IndexError, ProcessLookupError, PermissionError):
+        pass
+    try:
+        LEGACY_HOME.rename(HOME)
+    except OSError as e:
+        print(f"예전 설정({LEGACY_HOME})을 옮기지 못했습니다: {e}", file=sys.stderr)
+        return
+    kill_orphans()
+    PIDFILE.unlink(missing_ok=True)
+    STATUS.unlink(missing_ok=True)
+    print(f"설정을 옮겼습니다: {LEGACY_HOME} → {HOME}", file=sys.stderr)
+    desired = read_desired()
+    if desired["group"] in load_config()["groups"] and desired["tunnels"]:
+        start_daemon(desired["group"])
+
+
+def cmd_daemon(args):
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%m-%d %H:%M:%S", level=logging.INFO, stream=sys.stderr)
+    if read_pid() not in (None, os.getpid()):
+        logging.error("이미 데몬이 실행 중입니다.")
+        sys.exit(1)
+    Supervisor(args.group).run()
+
+
+# ---------------------------------------------------------------- main
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    # GUI 앱에서 실행되면 셸 PATH 를 물려받지 못해 aws·ssh 를 찾지 못한다
+    path = os.environ.get("PATH", "/usr/bin:/bin")
+    for extra in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"):
+        if extra not in path.split(":"):
+            path += ":" + extra
+    os.environ["PATH"] = path
+
+    p = argparse.ArgumentParser(prog="tunsw", description="TunnelSwitch — 그룹 단위 터널 스위처 (DB·웹 서비스 등)")
+    sub = p.add_subparsers(dest="cmd", metavar="명령")
+
+    s = sub.add_parser("use", help="그룹 전체 켜기 (켜져 있던 그룹은 꺼짐)")
+    s.add_argument("group", nargs="?")
+    s.set_defaults(func=cmd_use)
+    s = sub.add_parser("on", help="터널 켜기 (이름 생략 시 그룹 전체)")
+    s.add_argument("group")
+    s.add_argument("names", nargs="*")
+    s.set_defaults(func=cmd_on)
+    s = sub.add_parser("off", help="터널 끄기 (이름 생략 시 그룹 전체)")
+    s.add_argument("group")
+    s.add_argument("names", nargs="*")
+    s.set_defaults(func=cmd_off)
+    sub.add_parser("stop", help="모든 터널 끄기").set_defaults(func=cmd_stop)
+    s = sub.add_parser("open", help="웹 터널을 브라우저로 열기 (꺼져 있으면 켬)")
+    s.add_argument("group")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_open)
+    sub.add_parser("restart", help="켜진 터널 전부 다시 연결").set_defaults(func=cmd_restart)
+    s = sub.add_parser("status", help="연결 상태")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+    s = sub.add_parser("logs", help="데몬 로그")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("-n", "--lines", type=int, default=50)
+    s.set_defaults(func=cmd_logs)
+
+    s = sub.add_parser("add", help="터널 등록 (대화형)")
+    s.add_argument("group", nargs="?")
+    s.add_argument("--json", help="대화형 대신 터널 정보를 JSON 으로 받음")
+    s.add_argument("--replace", metavar="NAME", help="--json 과 함께: 기존 터널을 교체")
+    s.set_defaults(func=cmd_add)
+    s = sub.add_parser("list", help="등록된 터널 목록")
+    s.add_argument("group", nargs="?")
+    s.set_defaults(func=cmd_list)
+    s = sub.add_parser("remove", help="터널 삭제")
+    s.add_argument("group")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_remove)
+    s = sub.add_parser("group-add", help="그룹 추가")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_group_add)
+    s = sub.add_parser("group-rename", help="그룹 이름 변경")
+    s.add_argument("group")
+    s.add_argument("new_name")
+    s.set_defaults(func=cmd_group_rename)
+    s = sub.add_parser("group-remove", help="그룹 삭제")
+    s.add_argument("group")
+    s.add_argument("--force", action="store_true", help="터널이 있어도 함께 삭제")
+    s.set_defaults(func=cmd_group_remove)
+    sub.add_parser("edit", help="config.json 을 에디터로 직접 수정").set_defaults(func=cmd_edit)
+
+    s = sub.add_parser("_daemon")
+    s.add_argument("group")
+    s.set_defaults(func=cmd_daemon)
+
+    args = p.parse_args()
+    if args.cmd != "_daemon":
+        migrate_legacy_home()
+    if not getattr(args, "func", None):
+        p.print_help()
+        return
+    # 그룹은 표시 이름으로도 지정할 수 있다. 이후로는 키만 다룬다.
+    if getattr(args, "group", None) and args.cmd != "_daemon":
+        args.group = resolve_group(load_config(), args.group)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
