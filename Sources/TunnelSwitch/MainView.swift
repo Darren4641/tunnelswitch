@@ -187,6 +187,7 @@ struct TunnelRow: View {
                 } label: {
                     Text(copied ? "복사됨" : "127.0.0.1:\(String(tunnel.config.local_port))")
                         .font(.system(.callout, design: .monospaced))
+                        .fixedSize()  // 좁은 메뉴바 패널에서도 포트가 잘리지 않게
                 }
                 .help("로컬 포트 복사")
                 if let url = tunnel.url, let onOpen {
