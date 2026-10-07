@@ -7,6 +7,25 @@ struct Snapshot: Decodable {
     var log: String
 }
 
+/// `tunsw update --check --json` 응답
+struct UpdateInfo: Decodable {
+    var current: String
+    var latest: String
+    /// 설치 후 새로 올라온 커밋 제목 (최신 순). 비어 있으면 최신 버전
+    var commits: [String]
+    /// 마지막 업데이트 상태: running / failed / done
+    var state: String?
+    var message: String?
+
+    var available: Bool { !commits.isEmpty }
+
+    /// `tunsw update --status` 응답
+    struct Status: Decodable {
+        var state: String?
+        var message: String?
+    }
+}
+
 struct TunnelGroup: Decodable, Identifiable {
     var key: String
     var label: String
@@ -25,6 +44,9 @@ struct Tunnel: Decodable, Identifiable {
     var restarts: Int
     var last_error: String?
     var id: String { config.name }
+
+    /// 경유 서버에 셸로 접속할 수 있는 방식 (eic·ssh·web). eic-direct 는 SSH 를 쓰지 않는다.
+    var canLogin: Bool { config.type != TunnelType.eicDirect.rawValue }
 }
 
 struct TunnelConfig: Codable {

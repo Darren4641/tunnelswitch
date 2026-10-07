@@ -38,6 +38,7 @@ struct MainView: View {
                     Button("닫기") { store.error = nil }
                 }
             }
+            UpdateBanner()
 
             HStack {
                 Button {
@@ -47,6 +48,11 @@ struct MainView: View {
                 .disabled(store.selectedGroup == nil)
                 Spacer()
                 if store.busy { ProgressView().controlSize(.small) }
+                if let u = store.update {
+                    Text("버전 \(u.current)").font(.caption).foregroundStyle(.tertiary)
+                }
+                Button("업데이트 확인") { store.checkForUpdate(manual: true) }
+                    .disabled(store.updating)
                 Button("로그 보기") { store.openLog() }
             }
         }
@@ -133,6 +139,7 @@ struct TunnelList: View {
                         TunnelRow(tunnel: t,
                                   onToggle: { store.setTunnel(t.config.name, in: group.key, on: $0) },
                                   onOpen: { store.openInBrowser(t.config.name, in: group.key) },
+                                  onTerminal: { store.openTerminal(t.config.name, in: group.key) },
                                   onEdit: { store.beginEdit(Draft(group: group.key, config: t.config)) },
                                   onDelete: { store.delete(t, in: group.key) })
                     }
@@ -148,6 +155,7 @@ struct TunnelRow: View {
     let tunnel: Tunnel
     let onToggle: (Bool) -> Void
     var onOpen: (() -> Void)?
+    var onTerminal: (() -> Void)?
     var onEdit: (() -> Void)?
     var onDelete: (() -> Void)?
     var compact = false
@@ -190,12 +198,18 @@ struct TunnelRow: View {
                         .fixedSize()  // 좁은 메뉴바 패널에서도 포트가 잘리지 않게
                 }
                 .help("로컬 포트 복사")
-                if let url = tunnel.url, let onOpen {
-                    Button(action: onOpen) { Label("브라우저", systemImage: "safari") }
-                        .controlSize(.small)
-                        .disabled(store.busy)
-                        .help(tunnel.enabled ? "\(url) 열기" : "터널을 켜고 \(url) 열기")
+                HStack(spacing: 4) {
+                    if let url = tunnel.url, let onOpen {
+                        Button(action: onOpen) { Label("브라우저", systemImage: "safari") }
+                            .disabled(store.busy)
+                            .help(tunnel.enabled ? "\(url) 열기" : "터널을 켜고 \(url) 열기")
+                    }
+                    if tunnel.canLogin, let onTerminal {
+                        Button(action: onTerminal) { Label("터미널", systemImage: "terminal") }
+                            .help("새 터미널 창에서 \(tunnel.via) 접속")
+                    }
                 }
+                .controlSize(.small)
                 if let onEdit, let onDelete {
                     HStack(spacing: 4) {
                         Button(action: onEdit) { Image(systemName: "pencil") }.help("편집")
@@ -226,6 +240,27 @@ extension Tunnel {
         case "connecting": return restarts > 0 ? "재연결 중 (\(restarts)회)" : "연결 중"
         case "port_conflict": return "로컬 포트를 다른 프로그램이 사용 중"
         default: return "꺼짐"
+        }
+    }
+}
+
+/// 새 버전 안내, 업데이트 진행 중, 업데이트 실패를 보여 준다.
+struct UpdateBanner: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        if store.updating {
+            Banner(text: "업데이트 중… 빌드가 끝나면 앱이 다시 열립니다.", color: .blue) {
+                ProgressView()
+            }
+        } else if let err = store.updateError {
+            Banner(text: err, color: .red) {
+                Button("닫기") { store.updateError = nil }
+            }
+        } else if let u = store.update, u.available {
+            Banner(text: "새 버전이 있습니다 (\(u.current) → \(u.latest), 커밋 \(u.commits.count)개)", color: .blue) {
+                Button("업데이트") { store.startUpdate() }
+            }
         }
     }
 }

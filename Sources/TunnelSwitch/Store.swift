@@ -10,14 +10,25 @@ final class Store: ObservableObject {
     @Published var draft = Draft(group: "")
     @Published var formError: String?
     @Published var showEditor = false
+    @Published var update: UpdateInfo?
+    @Published var updating = false
+    @Published var updateError: String?
 
     private var timer: Timer?
+    private var updateTimer: Timer?
     private var refreshing = false
+
+    /// "나중에" 를 누른 버전. 같은 버전은 다시 묻지 않는다.
+    private let declinedKey = "declinedUpdate"
 
     init() {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
+        }
+        checkForUpdate()
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkForUpdate() }
         }
     }
 
@@ -84,6 +95,11 @@ final class Store: ObservableObject {
     /// web 터널을 브라우저로 연다. 꺼져 있으면 켜고 연결될 때까지 기다린다 (다른 그룹은 꺼짐).
     func openInBrowser(_ name: String, in group: String) {
         perform(["open", group, name])
+    }
+
+    /// 터널이 거쳐 가는 서버(배스천·SSH 서버)에 새 터미널 창에서 SSH 접속한다. 터널 상태는 그대로 둔다.
+    func openTerminal(_ name: String, in group: String) {
+        perform(["ssh", "--window", group, name])
     }
 
     func beginEdit(_ draft: Draft) {
@@ -157,6 +173,88 @@ final class Store: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
+    }
+
+    // MARK: 업데이트
+
+    /// 새 버전이 있는지 확인한다. 새 버전이면 업데이트할지 묻는다 (나중에 를 누른 버전은 묻지 않음).
+    /// manual: 사용자가 직접 확인한 경우. 최신이거나 확인에 실패해도 알려 주고, 거절했던 버전도 다시 묻는다.
+    func checkForUpdate(manual: Bool = false) {
+        guard !updating else { return }
+        Task.detached {
+            let r = Engine.run(["update", "--check", "--json"])
+            await MainActor.run {
+                guard r.code == 0,
+                      let info = try? JSONDecoder().decode(UpdateInfo.self, from: Data(r.out.utf8)) else {
+                    // 자동 확인은 오프라인 등으로 실패해도 조용히 넘어간다
+                    if manual { self.updateError = "업데이트 확인 실패: \(r.message)" }
+                    return
+                }
+                self.update = info
+                if !info.available {
+                    if manual { self.inform("최신 버전입니다", "설치된 버전: \(info.current)") }
+                    return
+                }
+                if manual || UserDefaults.standard.string(forKey: self.declinedKey) != info.latest {
+                    self.askToUpdate(info)
+                }
+            }
+        }
+    }
+
+    private func askToUpdate(_ info: UpdateInfo) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "새 버전이 있습니다. 업데이트할까요?"
+        let list = info.commits.prefix(8).map { "• \($0)" }.joined(separator: "\n")
+        let more = info.commits.count > 8 ? "\n외 \(info.commits.count - 8)개" : ""
+        alert.informativeText = "\(info.current) → \(info.latest)\n\n\(list)\(more)\n\n"
+            + "앱을 다시 빌드해 설치한 뒤 다시 엽니다. 켜진 터널은 끊기지 않습니다."
+        alert.addButton(withTitle: "업데이트")
+        alert.addButton(withTitle: "나중에")
+        if alert.runModal() == .alertFirstButtonReturn {
+            startUpdate()
+        } else {
+            UserDefaults.standard.set(info.latest, forKey: declinedKey)
+        }
+    }
+
+    /// 백그라운드에서 git pull + install.sh 를 실행한다. 성공하면 install.sh 가 앱을 종료하고 다시 띄우고,
+    /// 실패하면 이 앱이 살아 있으므로 상태 파일을 읽어 이유를 보여 준다.
+    func startUpdate() {
+        updating = true
+        updateError = nil
+        Task.detached {
+            let r = Engine.run(["update", "--background"])
+            guard r.code == 0 else {
+                await MainActor.run {
+                    self.updating = false
+                    self.updateError = r.message
+                }
+                return
+            }
+            while true {
+                try? await Task.sleep(for: .seconds(2))
+                let s = Engine.run(["update", "--status"])
+                let status = try? JSONDecoder().decode(UpdateInfo.Status.self, from: Data(s.out.utf8))
+                if status?.state == "running" { continue }
+                await MainActor.run {
+                    self.updating = false
+                    if status?.state == "failed" {
+                        self.updateError = status?.message ?? "업데이트에 실패했습니다."
+                    }
+                }
+                return
+            }
+        }
+    }
+
+    private func inform(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.runModal()
     }
 
     func openLog() {

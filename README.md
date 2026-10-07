@@ -26,6 +26,8 @@
 - 메뉴바에는 켜진 그룹 이름이 보이고, 아직 연결 안 된 터널이 있으면 아이콘이 ⚠︎ 로 바뀐다
 - 끊기면 ssh 가 마지막으로 남긴 메시지를 터널 아래에 보여 준다
 - 웹 서비스 터널은 "브라우저" 버튼을 누르면 터널을 켜고 연결될 때까지 기다렸다가 연다
+- "터미널" 버튼을 누르면 새 터미널 창에서 그 터널이 거쳐 가는 배스천·SSH 서버에 바로 SSH 접속한다
+- 새 버전이 올라오면 업데이트할지 묻는다 ([업데이트](#업데이트))
 - 같은 기능을 터미널에서 `tunsw` 명령으로도 쓸 수 있다 ([CLI](#cli))
 
 ## 요구 사항
@@ -42,11 +44,25 @@ cd tunnelswitch
 ./scripts/install.sh
 ```
 
-빌드해서 `~/Applications/TunnelSwitch.app` 에 설치하고 실행한다. 이후에는 Launchpad·Spotlight 에서 "TunnelSwitch"(터널 스위처)로 연다.
+빌드해서 `/Applications/TunnelSwitch.app` 에 설치하고 실행한다 (관리자 계정이 아니면 `sudo` 비밀번호를 묻는다).
+예전에 `~/Applications` 에 설치했다면 그 사본은 지운다. 이후에는 Launchpad·Spotlight 에서 "TunnelSwitch"(터널 스위처)로 연다.
 터미널용 `tunsw` 명령도 `~/.local/bin/tunsw` 에 링크된다 (예전 이름 `dbtun` 도 같은 명령으로 링크된다).
 
 예전 이름(DB 터널)에서 올라오는 경우 `install.sh` 가 `DBTunnel.app` 을 지우고, 엔진을 처음 실행할 때
 `~/.config/dbtunnel` 을 `~/.config/tunnelswitch` 로 옮긴다. 켜져 있던 터널은 새 데몬으로 다시 켜진다.
+
+## 업데이트
+
+앱은 켤 때와 6시간마다 이 레포의 원격 브랜치를 확인해서, 설치한 뒤 새 커밋이 올라왔으면 업데이트할지 묻는다.
+"업데이트" 를 누르면 `git pull` → `install.sh` 로 다시 빌드해 설치하고 앱을 다시 연다. 켜진 터널은 끊기지 않는다.
+"나중에" 를 누른 버전은 다시 묻지 않고, 창 아래 배너와 "업데이트 확인" 버튼으로 언제든 업데이트할 수 있다.
+
+- 레포에 커밋하지 않은 변경이 있으면 업데이트하지 않는다
+- 관리자 계정이 아니면 앱에서는 업데이트할 수 없다 (`sudo` 가 필요). 터미널에서 `tunsw update` 를 실행한다
+- 진행 로그는 `~/.config/tunnelswitch/update.log`
+
+`install.sh` 가 레포 경로와 설치한 커밋을 앱 번들(`Contents/Resources/repo`, `commit`)에 적어 두고 이걸로 비교한다.
+그래서 레포를 옮기거나 지우면 업데이트를 확인할 수 없다. 옮긴 위치에서 `install.sh` 를 다시 실행한다.
 
 ## 구성
 
@@ -74,6 +90,10 @@ SSH(pem)·웹 서비스 방식은 **pem 키** 또는 **비밀번호**로 인증�
 
 웹 서비스 터널은 목록의 "브라우저" 버튼(또는 `tunsw open`)으로 연다. 꺼져 있으면 켜고 연결될 때까지 기다린 뒤 연다.
 
+EIC → 배스천, SSH(pem), 웹 서비스 터널은 "터미널" 버튼(또는 `tunsw ssh`)으로 경유 서버에 셸로 접속할 수 있다.
+터널과 같은 키·비밀번호·EIC 설정을 쓰고, 터널을 켜고 끄는 것과는 상관없다. 버튼은 기본 터미널 앱
+(`.command` 파일을 여는 앱, 보통 Terminal) 의 새 창에서 연다.
+
 EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 연결할 때마다
 `send-ssh-public-key` 로 배스천에 올린다. 필요한 권한은 `ec2-instance-connect:SendSSHPublicKey`,
 `ec2-instance-connect:OpenTunnel` 이고, EIC Endpoint ID 를 비워 두면 `ec2:DescribeInstanceConnectEndpoints` 도 필요하다.
@@ -86,6 +106,7 @@ EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 
 - `daemon.log` — 연결 로그 (5MB 넘으면 시작할 때 `.log.1` 로 교체)
 - `desired.json` — 켜져 있어야 할 터널 목록. 데몬이 1초마다 읽어 실제 상태를 맞춘다
 - `daemon.pid`, `status.json` — 실행 상태
+- `update.json`, `update.log` — 마지막 업데이트 상태와 로그
 - `askpass.sh` — 비밀번호 인증용 `SSH_ASKPASS` 스크립트 (비밀번호는 담지 않고 환경변수에서 읽는다)
 
 ## CLI
@@ -94,7 +115,9 @@ EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 
 tunsw on  <group> [name ...]    # 켜기 (이름 생략 시 그룹 전체). 다른 그룹은 꺼짐
 tunsw off <group> [name ...]    # 끄기 (이름 생략 시 그룹 전체)
 tunsw open <group> <name>       # 웹 서비스 터널을 브라우저로 열기 (꺼져 있으면 켬)
+tunsw ssh  <group> <name>       # 터널이 거쳐 가는 배스천·SSH 서버에 셸로 접속 (--window: 새 터미널 창)
 tunsw status | stop | restart | logs -f
+tunsw update [--check]          # 새 버전 확인 / 받아서 다시 설치
 tunsw add | list | remove <group> <name> | edit
 tunsw group-add <이름> | group-rename <group> <새 이름> | group-remove <group> [--force]
 ```

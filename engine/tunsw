@@ -12,6 +12,8 @@
   eic-direct  EIC open-tunnel 로 VPC 내부 IP:포트에 직접 연결 (배스천 없음)
   web         SSH 서버를 거쳐 웹 서비스(ArgoCD·Jenkins 등)를 localhost 로 포워딩
 
+eic·ssh·web 은 `tunsw ssh` 로 경유 서버(배스천·SSH 서버)에 셸로 바로 접속할 수도 있다.
+
 ssh·web 은 pem 키(auth=key, 기본) 또는 비밀번호(auth=password)로 인증한다.
 비밀번호는 SSH_ASKPASS 로 ssh 에 넘긴다 (config.json 은 권한 600).
 """
@@ -21,11 +23,13 @@ import getpass
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -40,6 +44,9 @@ LOGFILE = HOME / "daemon.log"
 KNOWN_HOSTS = HOME / "known_hosts"
 EIC_KEY = HOME / "eic_ed25519"
 ASKPASS = HOME / "askpass.sh"
+UPDATE_STATUS = HOME / "update.json"
+UPDATE_LOG = HOME / "update.log"
+APP_BUNDLE = Path("/Applications/TunnelSwitch.app")
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
 STABLE_SECONDS = 60
@@ -50,6 +57,7 @@ GROUP_NAME_MAX = 30
 
 TYPES = ("eic", "ssh", "eic-direct", "web")
 SSH_TYPES = ("ssh", "web")
+LOGIN_TYPES = ("eic",) + SSH_TYPES  # 경유 서버에 셸로 접속할 수 있는 방식
 AUTHS = ("key", "password")
 SCHEMES = ("http", "https")
 WEB_DEFAULT_HOST = "127.0.0.1"
@@ -568,12 +576,16 @@ def cmd_use(args):
     turn_on(args.group or choose_group(cfg, "켤 그룹"), [])
 
 
+def find_tunnel(cfg, group_name, name):
+    t = next((t for t in get_group(cfg, group_name)["tunnels"] if t["name"] == name), None)
+    if t is None:
+        die(f"[{label(cfg, group_name)}] 에 없는 터널: {name}")
+    return t
+
+
 def cmd_open(args):
     """web 터널을 (꺼져 있으면 켜고) 브라우저로 연다."""
-    cfg = load_config()
-    t = next((t for t in get_group(cfg, args.group)["tunnels"] if t["name"] == args.name), None)
-    if t is None:
-        die(f"[{label(cfg, args.group)}] 에 없는 터널: {args.name}")
+    t = find_tunnel(load_config(), args.group, args.name)
     url = url_of(t)
     if not url:
         die(f"'{args.name}' 은 웹 터널이 아닙니다.")
@@ -586,6 +598,47 @@ def cmd_open(args):
     else:
         die(f"'{args.name}' 이 20초 안에 연결되지 않았습니다. 로그: tunsw logs")
     subprocess.call(["open", url])
+
+
+def cmd_ssh(args):
+    """터널이 거쳐 가는 서버(배스천·SSH 서버)에 셸로 접속한다. 터널을 켜고 끄는 것과는 상관없다.
+
+    --window 면 새 터미널 창에서 연다 (앱의 "터미널" 버튼).
+    """
+    t = find_tunnel(load_config(), args.group, args.name)
+    if t["type"] not in LOGIN_TYPES:
+        die(f"'{args.name}' 은 SSH 로 접속하는 터널이 아닙니다 ({t['type']}).")
+    if args.window:
+        open_terminal(["ssh", args.group, args.name])
+        return
+    aws = shutil.which("aws") or "aws"
+    try:
+        if t["type"] == "eic":
+            ensure_eic_key()
+            push_eic_key(t, aws)
+        cmd = build_command(t, aws, interactive=True)
+    except TunnelError as e:
+        die(str(e))
+    if t.get("auth") == "password":
+        ensure_askpass()
+    print(f"{via_of(t)} 접속 중…", file=sys.stderr)
+    os.execvpe(cmd[0], cmd, build_env(t) or os.environ)
+
+
+def open_terminal(engine_args):
+    """기본 터미널 앱(.command 를 여는 앱) 새 창에서 tunsw 명령을 실행한다.
+
+    스크립트는 실행되자마자 스스로 지운다.
+    """
+    ensure_home()
+    fd, path = tempfile.mkstemp(prefix="terminal-", suffix=".command", dir=HOME)
+    cmd = [sys.executable, str(Path(__file__).resolve())] + engine_args
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nrm -f "$0"\nclear\nexec ' + " ".join(shlex.quote(a) for a in cmd) + "\n")
+    os.chmod(path, 0o700)
+    if subprocess.call(["open", path]) != 0:
+        os.unlink(path)
+        die("터미널을 열지 못했습니다.")
 
 
 def cmd_restart(_args):
@@ -745,6 +798,128 @@ def cmd_logs(args):
         pass
 
 
+# ---------------------------------------------------------------- 업데이트
+#
+# 앱은 git clone 한 레포에서 install.sh 로 설치한다. install.sh 가 레포 경로와 설치한 커밋을
+# 앱 번들 Resources/repo, Resources/commit 에 적어 두고, 원격 브랜치와 비교해 새 버전을 찾는다.
+
+class UpdateError(Exception):
+    pass
+
+
+def bundle_files(name):
+    """번들 안에서 실행 중이면 그 번들의, 아니면(레포의 CLI) 설치된 앱의 Resources/<name>"""
+    return [Path(__file__).resolve().parent / name, APP_BUNDLE / "Contents" / "Resources" / name]
+
+
+def read_bundle_file(name):
+    for f in bundle_files(name):
+        if f.is_file():
+            return f.read_text().strip()
+    return None
+
+
+def repo_dir():
+    repo = read_bundle_file("repo")
+    if repo and (Path(repo) / ".git").exists():
+        return Path(repo)
+    here = Path(__file__).resolve().parent.parent
+    if (here / ".git").exists():
+        return here
+    raise UpdateError("앱을 설치한 레포를 찾지 못했습니다. 레포에서 scripts/install.sh 를 다시 실행하세요.")
+
+
+def git(repo, *args, timeout=60):
+    # 인증을 물어보며 멈추지 않게 한다
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes")
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        raise UpdateError(f"git {args[0]} 시간 초과")
+    if r.returncode != 0:
+        raise UpdateError(f"git {args[0]} 실패: " + last_nonempty(r.stderr))
+    return r.stdout.strip()
+
+
+def read_update_status():
+    try:
+        return json.loads(UPDATE_STATUS.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def update_info(fetch=True):
+    """설치된 커밋과 원격 브랜치를 비교한다. commits: 설치 후 새로 올라온 커밋 제목 (최신 순)"""
+    repo = repo_dir()
+    if fetch:
+        git(repo, "fetch", "--quiet")
+    latest = git(repo, "rev-parse", "@{u}")
+    current = read_bundle_file("commit") or git(repo, "rev-parse", "HEAD")
+    try:
+        commits = git(repo, "log", "--format=%s", f"{current}..{latest}").splitlines()
+    except UpdateError:  # 설치한 커밋이 레포에 없으면 (rebase 등) 레포 HEAD 기준
+        commits = git(repo, "log", "--format=%s", f"HEAD..{latest}").splitlines()
+    return {"repo": str(repo), "current": current[:7], "latest": latest[:7], "commits": commits,
+            **{k: v for k, v in read_update_status().items() if k in ("state", "message")}}
+
+
+def run_update():
+    """git pull 후 install.sh 로 빌드·설치한다. install.sh 가 앱을 종료하고 다시 띄운다."""
+    repo = repo_dir()
+    if git(repo, "status", "--porcelain", "--untracked-files=no"):
+        raise UpdateError(f"레포({repo})에 커밋하지 않은 변경이 있어 업데이트하지 않았습니다.")
+    if not os.access("/Applications", os.W_OK) and not sys.stdin.isatty():
+        raise UpdateError("/Applications 에 설치하려면 관리자 권한이 필요합니다. 터미널에서 tunsw update 를 실행하세요.")
+    print(f"업데이트: {repo}", flush=True)
+    git(repo, "pull", "--ff-only", timeout=180)
+    proc = subprocess.Popen([str(repo / "scripts" / "install.sh")], cwd=repo,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    last = None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        if line.strip():
+            last = line.strip()
+    if proc.wait() != 0:
+        raise UpdateError(f"설치 실패: {last or '종료 코드 ' + str(proc.returncode)} (로그: {UPDATE_LOG})")
+
+
+def cmd_update(args):
+    if args.status:
+        print(json.dumps(read_update_status(), ensure_ascii=False))
+        return
+    if args.check:
+        try:
+            info = update_info()
+        except UpdateError as e:
+            die(str(e))
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False))
+        elif info["commits"]:
+            print(f"새 버전이 있습니다: {info['current']} → {info['latest']} (커밋 {len(info['commits'])}개)")
+            for c in info["commits"]:
+                print(f"  - {c}")
+            print("업데이트: tunsw update")
+        else:
+            print(f"최신 버전입니다 ({info['current']}).")
+        return
+    if args.background:
+        # 앱이 업데이트 중에 종료되므로 앱과 떨어진 프로세스로 돌린다
+        write_json(UPDATE_STATUS, {"state": "running"})
+        with open(os.devnull, "rb") as devnull, UPDATE_LOG.open("wb") as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "update"],
+                             stdin=devnull, stdout=log, stderr=log, start_new_session=True, close_fds=True)
+        return
+    write_json(UPDATE_STATUS, {"state": "running"})
+    try:
+        run_update()
+    except UpdateError as e:
+        write_json(UPDATE_STATUS, {"state": "failed", "message": str(e)})
+        die(str(e))
+    write_json(UPDATE_STATUS, {"state": "done"})
+    print("업데이트했습니다.")
+
+
 # ---------------------------------------------------------------- 데몬
 
 class Supervisor:
@@ -826,74 +1001,79 @@ class Supervisor:
             self.status["tunnels"].pop(name, None)
             write_json(STATUS, self.status)
 
-    def aws_common(self, t):
-        args = ["--profile", t["profile"]]
-        if t.get("region"):
-            args += ["--region", t["region"]]
-        return args
 
-    def push_eic_key(self, t):
-        cmd = [self.aws, "ec2-instance-connect", "send-ssh-public-key",
-               "--instance-id", t["instance_id"],
-               "--instance-os-user", t.get("os_user", "ec2-user"),
-               "--ssh-public-key", f"file://{EIC_KEY}.pub"] + self.aws_common(t)
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            raise TunnelError("send-ssh-public-key 시간 초과")
-        if r.returncode != 0:
-            raise TunnelError("send-ssh-public-key 실패: " + last_nonempty(r.stderr))
+def aws_common(t):
+    args = ["--profile", t["profile"]]
+    if t.get("region"):
+        args += ["--region", t["region"]]
+    return args
 
-    def build_command(self, t):
-        forward = f"127.0.0.1:{t['local_port']}:{remote_host_of(t)}:{t['remote_port']}"
-        password = t.get("auth") == "password"
-        ssh_opts = [
-            "-N", "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
-        ]
-        if password:
-            # 비밀번호는 SSH_ASKPASS 로 넘긴다 (build_env). 틀리면 한 번만 시도하고 끊는다.
-            ssh_opts += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
-                         "-o", "PreferredAuthentications=password,keyboard-interactive",
-                         "-o", "NumberOfPasswordPrompts=1"]
-        else:
-            ssh_opts += ["-o", "BatchMode=yes"]
-        if t["type"] == "eic":
-            proxy = [self.aws, "ec2-instance-connect", "open-tunnel",
-                     "--instance-id", t["instance_id"]] + self.aws_common(t)
-            if t.get("eice_id"):
-                proxy += ["--instance-connect-endpoint-id", t["eice_id"]]
-            return ["ssh"] + ssh_opts + [
-                "-i", str(EIC_KEY),
-                "-o", "ProxyCommand=" + " ".join(sh_quote(a) for a in proxy),
-                "-L", forward,
-                f"{t.get('os_user', 'ec2-user')}@{t['instance_id']}",
-            ]
-        if t["type"] in SSH_TYPES:
-            identity = [] if password else ["-i", t["key"]]
-            return ["ssh"] + ssh_opts + identity + [
-                "-p", str(t.get("ssh_port", 22)),
-                "-L", forward, f"{t['user']}@{t['host']}",
-            ]
-        if t["type"] == "eic-direct":
-            return [self.aws, "ec2-instance-connect", "open-tunnel",
-                    "--instance-connect-endpoint-id", t["eice_id"],
-                    "--private-ip-address", t["private_ip"],
-                    "--remote-port", str(t["remote_port"]),
-                    "--local-port", str(t["local_port"])] + self.aws_common(t)
-        raise TunnelError(f"알 수 없는 방식: {t['type']}")
 
-    def build_env(self, t):
-        """비밀번호 인증이면 ssh 가 tty 없이 askpass 스크립트로 비밀번호를 읽게 한다."""
-        if t.get("auth") != "password":
-            return None
-        env = dict(os.environ)
-        env.update(SSH_ASKPASS=str(ASKPASS), SSH_ASKPASS_REQUIRE="force",
-                   TUNSW_SSH_PASSWORD=t["password"])
-        return env
+def push_eic_key(t, aws):
+    cmd = [aws, "ec2-instance-connect", "send-ssh-public-key",
+           "--instance-id", t["instance_id"],
+           "--instance-os-user", t.get("os_user", "ec2-user"),
+           "--ssh-public-key", f"file://{EIC_KEY}.pub"] + aws_common(t)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise TunnelError("send-ssh-public-key 시간 초과")
+    if r.returncode != 0:
+        raise TunnelError("send-ssh-public-key 실패: " + last_nonempty(r.stderr))
+
+
+def build_command(t, aws, interactive=False):
+    """터널 명령. interactive 면 포워딩 없이 경유 서버에 셸로 접속하는 ssh 명령 (eic·ssh·web)."""
+    password = t.get("auth") == "password"
+    ssh_opts = [
+        "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+    ]
+    if interactive:
+        forward = []
+    else:
+        ssh_opts = ["-N", "-o", "ExitOnForwardFailure=yes"] + ssh_opts
+        forward = ["-L", f"127.0.0.1:{t['local_port']}:{remote_host_of(t)}:{t['remote_port']}"]
+    if password:
+        # 비밀번호는 SSH_ASKPASS 로 넘긴다 (build_env). 틀리면 한 번만 시도하고 끊는다.
+        ssh_opts += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
+                     "-o", "PreferredAuthentications=password,keyboard-interactive",
+                     "-o", "NumberOfPasswordPrompts=1"]
+    elif not interactive:
+        ssh_opts += ["-o", "BatchMode=yes"]
+    if t["type"] == "eic":
+        proxy = [aws, "ec2-instance-connect", "open-tunnel",
+                 "--instance-id", t["instance_id"]] + aws_common(t)
+        if t.get("eice_id"):
+            proxy += ["--instance-connect-endpoint-id", t["eice_id"]]
+        return ["ssh"] + ssh_opts + [
+            "-i", str(EIC_KEY),
+            "-o", "ProxyCommand=" + " ".join(sh_quote(a) for a in proxy),
+        ] + forward + [f"{t.get('os_user', 'ec2-user')}@{t['instance_id']}"]
+    if t["type"] in SSH_TYPES:
+        identity = [] if password else ["-i", t["key"]]
+        return ["ssh"] + ssh_opts + identity + [
+            "-p", str(t.get("ssh_port", 22)),
+        ] + forward + [f"{t['user']}@{t['host']}"]
+    if t["type"] == "eic-direct" and not interactive:
+        return [aws, "ec2-instance-connect", "open-tunnel",
+                "--instance-connect-endpoint-id", t["eice_id"],
+                "--private-ip-address", t["private_ip"],
+                "--remote-port", str(t["remote_port"]),
+                "--local-port", str(t["local_port"])] + aws_common(t)
+    raise TunnelError(f"알 수 없는 방식: {t['type']}")
+
+
+def build_env(t):
+    """비밀번호 인증이면 ssh 가 tty 없이 askpass 스크립트로 비밀번호를 읽게 한다."""
+    if t.get("auth") != "password":
+        return None
+    env = dict(os.environ)
+    env.update(SSH_ASKPASS=str(ASKPASS), SSH_ASKPASS_REQUIRE="force",
+               TUNSW_SSH_PASSWORD=t["password"])
+    return env
 
 
 class Worker:
@@ -945,9 +1125,9 @@ class Worker:
             return f"로컬 포트 {t['local_port']} 가 이미 사용 중"
         try:
             if t["type"] == "eic":
-                self.sup.push_eic_key(t)
-            cmd = self.sup.build_command(t)
-            env = self.sup.build_env(t)
+                push_eic_key(t, self.sup.aws)
+            cmd = build_command(t, self.sup.aws)
+            env = build_env(t)
         except TunnelError as e:
             return str(e)
 
@@ -1089,6 +1269,11 @@ def main():
     s.add_argument("group")
     s.add_argument("name")
     s.set_defaults(func=cmd_open)
+    s = sub.add_parser("ssh", help="터널이 거쳐 가는 서버(배스천·SSH 서버)에 셸로 접속 (eic·ssh·web)")
+    s.add_argument("group")
+    s.add_argument("name")
+    s.add_argument("--window", action="store_true", help="새 터미널 창에서 열기")
+    s.set_defaults(func=cmd_ssh)
     sub.add_parser("restart", help="켜진 터널 전부 다시 연결").set_defaults(func=cmd_restart)
     s = sub.add_parser("status", help="연결 상태")
     s.add_argument("--json", action="store_true")
@@ -1097,6 +1282,13 @@ def main():
     s.add_argument("-f", "--follow", action="store_true")
     s.add_argument("-n", "--lines", type=int, default=50)
     s.set_defaults(func=cmd_logs)
+
+    s = sub.add_parser("update", help="새 버전을 받아 앱·CLI 업데이트 (git pull + install.sh)")
+    s.add_argument("--check", action="store_true", help="새 버전이 있는지만 확인")
+    s.add_argument("--json", action="store_true", help="--check 결과를 JSON 으로")
+    s.add_argument("--background", action="store_true", help="업데이트를 백그라운드에서 실행 (앱용)")
+    s.add_argument("--status", action="store_true", help="마지막 업데이트 상태 (JSON)")
+    s.set_defaults(func=cmd_update)
 
     s = sub.add_parser("add", help="터널 등록 (대화형)")
     s.add_argument("group", nargs="?")
