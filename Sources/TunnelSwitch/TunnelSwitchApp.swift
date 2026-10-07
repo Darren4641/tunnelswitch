@@ -41,7 +41,7 @@ struct MenuBarPanel: View {
                     TunnelRow(tunnel: t,
                               onToggle: { store.setTunnel(t.config.name, in: g.key, on: $0) },
                               onOpen: { store.openInBrowser(t.config.name, in: g.key) },
-                              onTerminal: { store.openTerminal(t.config.name, in: g.key) },
+                              onConnect: { store.connect(t.config.name, in: g.key) },
                               compact: true)
                 }
             }

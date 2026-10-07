@@ -7,6 +7,12 @@ struct Snapshot: Decodable {
     var log: String
 }
 
+/// `tunsw terminals --json` 응답: SSH 접속에 쓸 수 있는 설치된 터미널 앱
+struct TerminalApp: Decodable, Identifiable {
+    var id: String
+    var name: String
+}
+
 /// `tunsw update --check --json` 응답
 struct UpdateInfo: Decodable {
     var current: String
@@ -45,15 +51,16 @@ struct Tunnel: Decodable, Identifiable {
     var last_error: String?
     var id: String { config.name }
 
-    /// 경유 서버에 셸로 접속할 수 있는 방식 (eic·ssh·web). eic-direct 는 SSH 를 쓰지 않는다.
-    var canLogin: Bool { config.type != TunnelType.eicDirect.rawValue }
+    /// SSH 접속(shell) 항목. 포워딩이 없어 켜고 끄지 않고 터미널로 접속만 한다.
+    var isShell: Bool { config.type == TunnelType.shell.rawValue }
 }
 
 struct TunnelConfig: Codable {
     var name: String
     var type: String
-    var local_port: Int
-    var remote_port: Int
+    /// shell(SSH 접속)에는 없다
+    var local_port: Int?
+    var remote_port: Int?
     var remote_host: String?
     var instance_id: String?
     var profile: String?
@@ -71,7 +78,7 @@ struct TunnelConfig: Codable {
 }
 
 enum TunnelType: String, CaseIterable, Identifiable {
-    case eic, ssh, eicDirect = "eic-direct", web
+    case eic, ssh, eicDirect = "eic-direct", web, shell
 
     var id: String { rawValue }
 
@@ -81,11 +88,12 @@ enum TunnelType: String, CaseIterable, Identifiable {
         case .ssh: return "SSH(pem) → 배스천"
         case .eicDirect: return "EIC 직접"
         case .web: return "웹 서비스"
+        case .shell: return "SSH 접속"
         }
     }
 
     /// SSH 로 접속하는 방식 (pem 또는 비밀번호 인증)
-    var usesSSH: Bool { self == .ssh || self == .web }
+    var usesSSH: Bool { self == .ssh || self == .web || self == .shell }
 
     var help: String {
         switch self {
@@ -93,6 +101,7 @@ enum TunnelType: String, CaseIterable, Identifiable {
         case .ssh: return "pem 키로 공인 IP 배스천에 SSH 한 뒤 RDS 로 포워딩합니다."
         case .eicDirect: return "EIC open-tunnel 로 VPC 내부 IP:포트에 직접 연결합니다."
         case .web: return "SSH 서버를 거쳐 ArgoCD·Jenkins 같은 웹 서비스를 localhost 로 열고 브라우저로 띄웁니다."
+        case .shell: return "터널 없이 ssh user@host 로 접속합니다. 목록의 \"접속\" 버튼을 누르면 터미널이 열립니다."
         }
     }
 }
@@ -140,8 +149,8 @@ struct Draft {
         original = c.name
         name = c.name
         type = TunnelType(rawValue: c.type) ?? .eic
-        localPort = String(c.local_port)
-        remotePort = String(c.remote_port)
+        localPort = c.local_port.map(String.init) ?? ""
+        remotePort = c.remote_port.map(String.init) ?? "3306"
         remoteHost = c.remote_host ?? ""
         instanceId = c.instance_id ?? ""
         profile = c.profile ?? ""
@@ -162,17 +171,17 @@ struct Draft {
     func json() -> String {
         func s(_ v: String) -> Any { v.trimmingCharacters(in: .whitespaces) }
         func n(_ v: String) -> Any { Int(v.trimmingCharacters(in: .whitespaces)) ?? v }
-        var d: [String: Any] = [
-            "name": s(name), "type": type.rawValue,
-            "local_port": n(localPort), "remote_port": n(remotePort),
-        ]
+        var d: [String: Any] = ["name": s(name), "type": type.rawValue]
+        if type != .shell {
+            d.merge(["local_port": n(localPort), "remote_port": n(remotePort)]) { $1 }
+        }
         switch type {
         case .eic:
             d.merge(["instance_id": s(instanceId), "profile": s(profile), "os_user": s(osUser),
                      "region": s(region), "eice_id": s(eiceId), "remote_host": s(remoteHost)]) { $1 }
-        case .ssh, .web:
-            d.merge(["host": s(host), "user": s(user), "ssh_port": n(sshPort),
-                     "auth": auth.rawValue, "remote_host": s(remoteHost)]) { $1 }
+        case .ssh, .web, .shell:
+            d.merge(["host": s(host), "user": s(user), "ssh_port": n(sshPort), "auth": auth.rawValue]) { $1 }
+            if type != .shell { d["remote_host"] = s(remoteHost) }
             // 비밀번호는 앞뒤 공백도 그대로 둔다
             if auth == .key { d["key"] = s(key) } else { d["password"] = password }
             if type == .web { d["scheme"] = scheme }

@@ -48,6 +48,13 @@ struct MainView: View {
                 .disabled(store.selectedGroup == nil)
                 Spacer()
                 if store.busy { ProgressView().controlSize(.small) }
+                if !store.terminals.isEmpty {
+                    Picker("터미널", selection: $store.terminal) {
+                        ForEach(store.terminals) { Text($0.name).tag($0.id) }
+                    }
+                    .fixedSize()
+                    .help("SSH 접속을 열 터미널 앱")
+                }
                 if let u = store.update {
                     Text("버전 \(u.current)").font(.caption).foregroundStyle(.tertiary)
                 }
@@ -71,7 +78,8 @@ struct GroupHeader: View {
     var compact = false
 
     var body: some View {
-        let on = group.tunnels.filter(\.enabled)
+        let tunnels = group.tunnels.filter { !$0.isShell }
+        let on = tunnels.filter(\.enabled)
         let connected = on.filter { $0.state == "connected" }.count
         HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -94,7 +102,7 @@ struct GroupHeader: View {
                 .disabled(store.busy)
             }
             Button("모두 켜기") { store.setAll(group.key, on: true) }
-                .disabled(store.busy || group.tunnels.isEmpty || on.count == group.tunnels.count)
+                .disabled(store.busy || tunnels.isEmpty || on.count == tunnels.count)
             Button("모두 끄기") { store.setAll(group.key, on: false) }
                 .disabled(store.busy || on.isEmpty)
         }
@@ -139,7 +147,7 @@ struct TunnelList: View {
                         TunnelRow(tunnel: t,
                                   onToggle: { store.setTunnel(t.config.name, in: group.key, on: $0) },
                                   onOpen: { store.openInBrowser(t.config.name, in: group.key) },
-                                  onTerminal: { store.openTerminal(t.config.name, in: group.key) },
+                                  onConnect: { store.connect(t.config.name, in: group.key) },
                                   onEdit: { store.beginEdit(Draft(group: group.key, config: t.config)) },
                                   onDelete: { store.delete(t, in: group.key) })
                     }
@@ -155,7 +163,7 @@ struct TunnelRow: View {
     let tunnel: Tunnel
     let onToggle: (Bool) -> Void
     var onOpen: (() -> Void)?
-    var onTerminal: (() -> Void)?
+    var onConnect: (() -> Void)?
     var onEdit: (() -> Void)?
     var onDelete: (() -> Void)?
     var compact = false
@@ -163,18 +171,25 @@ struct TunnelRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Toggle("", isOn: Binding(get: { tunnel.enabled }, set: onToggle))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .labelsHidden()
-                .disabled(store.busy)
-                .help(tunnel.enabled ? "이 터널 끄기" : "이 터널 켜기")
-            Circle().fill(tunnel.stateColor).frame(width: 10, height: 10).padding(.top, 5)
+            if tunnel.isShell {
+                // 켜고 끄는 게 없다. 스위치·상태 자리에 터미널 아이콘
+                Image(systemName: "terminal").foregroundStyle(.secondary).frame(width: 52).padding(.top, 2)
+            } else {
+                Toggle("", isOn: Binding(get: { tunnel.enabled }, set: onToggle))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .labelsHidden()
+                    .disabled(store.busy)
+                    .help(tunnel.enabled ? "이 터널 끄기" : "이 터널 켜기")
+                Circle().fill(tunnel.stateColor).frame(width: 10, height: 10).padding(.top, 5)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(tunnel.config.name).font(.body.bold())
-                    Text(tunnel.stateText).font(.caption)
-                        .foregroundStyle(tunnel.state == "off" ? Color.secondary : tunnel.stateColor)
+                    if !tunnel.isShell {
+                        Text(tunnel.stateText).font(.caption)
+                            .foregroundStyle(tunnel.state == "off" ? Color.secondary : tunnel.stateColor)
+                    }
                 }
                 Text("→ \(tunnel.target)").font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
@@ -187,29 +202,29 @@ struct TunnelRow: View {
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(String(tunnel.config.local_port), forType: .string)
-                    copied = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
-                } label: {
-                    Text(copied ? "복사됨" : "127.0.0.1:\(String(tunnel.config.local_port))")
-                        .font(.system(.callout, design: .monospaced))
-                        .fixedSize()  // 좁은 메뉴바 패널에서도 포트가 잘리지 않게
-                }
-                .help("로컬 포트 복사")
-                HStack(spacing: 4) {
-                    if let url = tunnel.url, let onOpen {
-                        Button(action: onOpen) { Label("브라우저", systemImage: "safari") }
-                            .disabled(store.busy)
-                            .help(tunnel.enabled ? "\(url) 열기" : "터널을 켜고 \(url) 열기")
+                if let port = tunnel.config.local_port {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(String(port), forType: .string)
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+                    } label: {
+                        Text(copied ? "복사됨" : "127.0.0.1:\(String(port))")
+                            .font(.system(.callout, design: .monospaced))
+                            .fixedSize()  // 좁은 메뉴바 패널에서도 포트가 잘리지 않게
                     }
-                    if tunnel.canLogin, let onTerminal {
-                        Button(action: onTerminal) { Label("터미널", systemImage: "terminal") }
-                            .help("새 터미널 창에서 \(tunnel.via) 접속")
-                    }
+                    .help("로컬 포트 복사")
                 }
-                .controlSize(.small)
+                if let url = tunnel.url, let onOpen {
+                    Button(action: onOpen) { Label("브라우저", systemImage: "safari") }
+                        .controlSize(.small)
+                        .disabled(store.busy)
+                        .help(tunnel.enabled ? "\(url) 열기" : "터널을 켜고 \(url) 열기")
+                }
+                if tunnel.isShell, let onConnect {
+                    Button(action: onConnect) { Label("접속", systemImage: "terminal") }
+                        .help("\(store.terminalName) 새 창에서 ssh \(tunnel.target)")
+                }
                 if let onEdit, let onDelete {
                     HStack(spacing: 4) {
                         Button(action: onEdit) { Image(systemName: "pencil") }.help("편집")

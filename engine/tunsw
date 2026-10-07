@@ -11,10 +11,9 @@
   ssh         pem 키로 공인 배스천에 SSH 한 뒤 -L 로 RDS 포워딩
   eic-direct  EIC open-tunnel 로 VPC 내부 IP:포트에 직접 연결 (배스천 없음)
   web         SSH 서버를 거쳐 웹 서비스(ArgoCD·Jenkins 등)를 localhost 로 포워딩
+  shell       터널이 아니라 SSH 접속 (ssh user@host). 켜고 끄지 않고 `tunsw ssh` 로 터미널에서 접속한다
 
-eic·ssh·web 은 `tunsw ssh` 로 경유 서버(배스천·SSH 서버)에 셸로 바로 접속할 수도 있다.
-
-ssh·web 은 pem 키(auth=key, 기본) 또는 비밀번호(auth=password)로 인증한다.
+ssh·web·shell 은 pem 키(auth=key, 기본) 또는 비밀번호(auth=password)로 인증한다.
 비밀번호는 SSH_ASKPASS 로 ssh 에 넘긴다 (config.json 은 권한 600).
 """
 
@@ -55,9 +54,8 @@ MAX_BACKOFF = 60
 DEFAULT_CONFIG = {"groups": {}}
 GROUP_NAME_MAX = 30
 
-TYPES = ("eic", "ssh", "eic-direct", "web")
-SSH_TYPES = ("ssh", "web")
-LOGIN_TYPES = ("eic",) + SSH_TYPES  # 경유 서버에 셸로 접속할 수 있는 방식
+TYPES = ("eic", "ssh", "eic-direct", "web", "shell")
+SSH_TYPES = ("ssh", "web", "shell")  # host·user·인증으로 SSH 접속하는 방식
 AUTHS = ("key", "password")
 SCHEMES = ("http", "https")
 WEB_DEFAULT_HOST = "127.0.0.1"
@@ -141,7 +139,15 @@ def remote_host_of(t):
     return t.get("remote_host")
 
 
+def is_tunnel(t):
+    """shell(SSH 접속)은 포워딩이 없어 켜고 끄지 않는다. 데몬·상태 계산에서 뺀다."""
+    return t["type"] != "shell"
+
+
 def target_of(t):
+    if t["type"] == "shell":
+        port = t.get("ssh_port", 22)
+        return f"{t['user']}@{t['host']}" + (f":{port}" if port != 22 else "")
     if t["type"] == "eic-direct":
         return f"{t['private_ip']}:{t['remote_port']}"
     return f"{remote_host_of(t)}:{t['remote_port']}"
@@ -254,6 +260,7 @@ def cmd_add(args):
         ("ssh", "ssh        — pem 키로 공인 배스천 경유"),
         ("eic-direct", "eic-direct — EIC 로 내부 IP 에 직접 (배스천 없이)"),
         ("web", "web        — SSH 경유 웹 서비스 (ArgoCD·Jenkins 등, 브라우저로 열기)"),
+        ("shell", "shell      — 터널 없이 SSH 접속 (ssh user@host, 터미널로 열기)"),
     ])
 
     def ask_ssh_login(kind):
@@ -283,6 +290,8 @@ def cmd_add(args):
         t["remote_host"] = ask("서비스 호스트 (SSH 서버에서 본 주소)", default=WEB_DEFAULT_HOST)
         t["remote_port"] = int(ask("서비스 포트", default=8080, validator=port_validator))
         t["scheme"] = choose("프로토콜", [("http", "http"), ("https", "https")])
+    elif t["type"] == "shell":
+        ask_ssh_login("SSH 서버")
     else:
         t["eice_id"] = ask("EIC Endpoint ID (eice-...)")
         t["profile"] = ask("AWS 프로파일")
@@ -290,14 +299,19 @@ def cmd_add(args):
         t["private_ip"] = ask("대상 내부 IP")
         t["remote_port"] = int(ask("대상 포트", default=3306, validator=port_validator))
 
-    client = "브라우저" if t["type"] == "web" else "DataGrip"
-    t["local_port"] = int(ask(f"로컬 포트 ({client} 에서 접속할 포트)", validator=local_port_validator))
+    if is_tunnel(t):
+        client = "브라우저" if t["type"] == "web" else "DataGrip"
+        t["local_port"] = int(ask(f"로컬 포트 ({client} 에서 접속할 포트)", validator=local_port_validator))
     t = {k: v for k, v in t.items() if v not in (None, "")}
 
     tunnels.append(t)
     save_config(cfg)
-    print(f"\n등록됨: [{label(cfg, group_name)}] {t['name']}  "
-          f"127.0.0.1:{t['local_port']} → {target_of(t)}  via {via_of(t)}")
+    if is_tunnel(t):
+        print(f"\n등록됨: [{label(cfg, group_name)}] {t['name']}  "
+              f"127.0.0.1:{t['local_port']} → {target_of(t)}  via {via_of(t)}")
+    else:
+        print(f"\n등록됨: [{label(cfg, group_name)}] {t['name']}  {via_of(t)}\n"
+              f"접속: tunsw ssh '{label(cfg, group_name)}' {t['name']}")
     if url_of(t):
         print(f"브라우저: {url_of(t)}")
 
@@ -318,6 +332,7 @@ REQUIRED = {
     "ssh": ("host", "user", "remote_host", "remote_port"),
     "eic-direct": ("eice_id", "profile", "private_ip", "remote_port"),
     "web": ("host", "user", "remote_port"),
+    "shell": ("host", "user"),
 }
 PORT_FIELDS = ("local_port", "remote_port", "ssh_port")
 
@@ -328,7 +343,8 @@ def validate_tunnel(t, others):
         return "이름을 입력하세요."
     if t.get("type") not in TYPES:
         return "방식을 선택하세요."
-    missing = [f for f in REQUIRED[t["type"]] + ("local_port",) if t.get(f) in (None, "")]
+    required = REQUIRED[t["type"]] + (("local_port",) if is_tunnel(t) else ())
+    missing = [f for f in required if t.get(f) in (None, "")]
     if missing:
         return "필수 항목이 비었습니다: " + ", ".join(missing)
     for f in PORT_FIELDS:
@@ -350,7 +366,7 @@ def validate_tunnel(t, others):
     for o in others:
         if o["name"] == t["name"]:
             return f"'{t['name']}' 이름이 이미 있습니다."
-        if o["local_port"] == t["local_port"]:
+        if is_tunnel(t) and o.get("local_port") == t["local_port"]:
             return f"로컬 포트 {t['local_port']} 는 '{o['name']}' 가 쓰고 있습니다."
     return None
 
@@ -393,7 +409,7 @@ def status_json():
         tunnels = []
         for t in group["tunnels"]:
             s = status.get("tunnels", {}).get(t["name"], {})
-            on = key == running and t["name"] in enabled
+            on = key == running and t["name"] in enabled and is_tunnel(t)
             state = tunnel_state(t, s, listeners) if on else "off"
             tunnels.append({
                 "config": t, "target": target_of(t), "via": via_of(t), "url": url_of(t),
@@ -416,6 +432,9 @@ def cmd_list(args):
         if not group["tunnels"]:
             print("  (등록된 터널 없음 — tunsw add)")
         for t in group["tunnels"]:
+            if not is_tunnel(t):
+                print(f"  {t['name']:<22} {via_of(t)}  (tunsw ssh 로 접속)")
+                continue
             print(f"  {t['name']:<22} 127.0.0.1:{t['local_port']:<6} → {target_of(t)}")
             print(f"  {'':<22} via {via_of(t)}")
             if url_of(t):
@@ -523,9 +542,12 @@ def write_desired(group_name, names):
 
 def resolve_names(cfg, group_name, names):
     group = get_group(cfg, group_name)
-    all_names = [t["name"] for t in group["tunnels"]]
+    all_names = [t["name"] for t in group["tunnels"] if is_tunnel(t)]
     if not all_names:
         die(f"[{label(cfg, group_name)}] 에 등록된 터널이 없습니다. 먼저: tunsw add '{label(cfg, group_name)}'")
+    shells = [n for n in names if n not in all_names and any(t["name"] == n for t in group["tunnels"])]
+    if shells:
+        die(f"SSH 접속은 켜고 끄지 않습니다. 접속: tunsw ssh '{label(cfg, group_name)}' {shells[0]}")
     unknown = [n for n in names if n not in all_names]
     if unknown:
         die(f"[{label(cfg, group_name)}] 에 없는 터널: {', '.join(unknown)}")
@@ -601,44 +623,92 @@ def cmd_open(args):
 
 
 def cmd_ssh(args):
-    """터널이 거쳐 가는 서버(배스천·SSH 서버)에 셸로 접속한다. 터널을 켜고 끄는 것과는 상관없다.
-
-    --window 면 새 터미널 창에서 연다 (앱의 "터미널" 버튼).
-    """
+    """SSH 접속(shell) 항목으로 접속한다. --window 면 새 터미널 창에서 연다 (앱의 "접속" 버튼)."""
     t = find_tunnel(load_config(), args.group, args.name)
-    if t["type"] not in LOGIN_TYPES:
-        die(f"'{args.name}' 은 SSH 로 접속하는 터널이 아닙니다 ({t['type']}).")
+    if t["type"] != "shell":
+        die(f"'{args.name}' 은 SSH 접속 항목이 아닙니다 ({t['type']}).")
     if args.window:
-        open_terminal(["ssh", args.group, args.name])
+        open_terminal(["ssh", args.group, args.name], args.terminal)
         return
-    aws = shutil.which("aws") or "aws"
-    try:
-        if t["type"] == "eic":
-            ensure_eic_key()
-            push_eic_key(t, aws)
-        cmd = build_command(t, aws, interactive=True)
-    except TunnelError as e:
-        die(str(e))
+    cmd = build_command(t, None)
     if t.get("auth") == "password":
         ensure_askpass()
-    print(f"{via_of(t)} 접속 중…", file=sys.stderr)
+    print(f"{t['name']}: {target_of(t)} 접속 중…", file=sys.stderr)
     os.execvpe(cmd[0], cmd, build_env(t) or os.environ)
 
 
-def open_terminal(engine_args):
-    """기본 터미널 앱(.command 를 여는 앱) 새 창에서 tunsw 명령을 실행한다.
+# 새 창에서 명령을 실행할 수 있는 터미널 앱. 앞에 있는 것일수록 기본으로 고른다 (macOS 터미널은 마지막).
+TERMINALS = [
+    ("iterm", "iTerm2", "iTerm.app"),
+    ("ghostty", "Ghostty", "Ghostty.app"),
+    ("wezterm", "WezTerm", "WezTerm.app"),
+    ("kitty", "kitty", "kitty.app"),
+    ("alacritty", "Alacritty", "Alacritty.app"),
+    ("terminal", "터미널", "Terminal.app"),
+]
+APP_DIRS = [Path("/Applications"), Path.home() / "Applications",
+            Path("/System/Applications/Utilities"), Path("/Applications/Utilities")]
 
-    스크립트는 실행되자마자 스스로 지운다.
+ITERM_SCRIPT = """on run argv
+  tell application "iTerm"
+    activate
+    set w to (create window with default profile)
+    tell current session of w to write text (quoted form of item 1 of argv)
+  end tell
+end run"""
+
+
+def installed_terminals():
+    """[(id, 이름, 앱 경로)] — 설치된 것만, 기본으로 고를 순서대로"""
+    found = []
+    for tid, name, bundle in TERMINALS:
+        app = next((d / bundle for d in APP_DIRS if (d / bundle).is_dir()), None)
+        if app:
+            found.append((tid, name, app))
+    return found
+
+
+def cmd_terminals(args):
+    terms = installed_terminals()
+    if args.json:
+        print(json.dumps([{"id": tid, "name": name} for tid, name, _ in terms], ensure_ascii=False))
+    else:
+        for tid, name, app in terms:
+            print(f"  {tid:<10} {name}  ({app})")
+
+
+def open_terminal(engine_args, terminal=None):
+    """터미널 앱 새 창에서 tunsw 명령을 실행한다. terminal: TERMINALS 의 id (없으면 설치된 것 중 첫 번째)
+
+    명령은 .command 스크립트로 만들어 넘기고, 스크립트는 실행되자마자 스스로 지운다.
     """
+    terms = installed_terminals()
+    if not terms:
+        die("터미널 앱을 찾지 못했습니다.")
+    tid, name, app = next((t for t in terms if t[0] == terminal), terms[0])
     ensure_home()
-    fd, path = tempfile.mkstemp(prefix="terminal-", suffix=".command", dir=HOME)
+    fd, script = tempfile.mkstemp(prefix="terminal-", suffix=".command", dir=HOME)
     cmd = [sys.executable, str(Path(__file__).resolve())] + engine_args
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write('#!/bin/sh\nrm -f "$0"\nclear\nexec ' + " ".join(shlex.quote(a) for a in cmd) + "\n")
-    os.chmod(path, 0o700)
-    if subprocess.call(["open", path]) != 0:
-        os.unlink(path)
-        die("터미널을 열지 못했습니다.")
+        # 새 창은 이 프로세스의 환경을 물려받지 않으므로 설정 위치를 넘겨 준다
+        f.write(f'#!/bin/sh\nrm -f "$0"\nclear\nexport TUNSW_HOME={shlex.quote(str(HOME))}\nexec '
+                + " ".join(shlex.quote(a) for a in cmd) + "\n")
+    os.chmod(script, 0o700)
+    if tid == "iterm":
+        # iTerm 은 파일로 열면 매번 실행할지 묻는다. 새 창을 만들어 스크립트 경로를 입력한다.
+        launch = ["osascript", "-e", ITERM_SCRIPT, script]
+    elif tid == "terminal":
+        launch = ["open", "-a", str(app), script]
+    elif tid == "wezterm":
+        launch = ["open", "-na", str(app), "--args", "start", "--", script]
+    elif tid == "kitty":
+        launch = ["open", "-na", str(app), "--args", script]
+    else:  # ghostty, alacritty
+        launch = ["open", "-na", str(app), "--args", "-e", script]
+    r = subprocess.run(launch, capture_output=True, text=True)
+    if r.returncode != 0:
+        Path(script).unlink(missing_ok=True)
+        die(f"{name} 을(를) 열지 못했습니다: {last_nonempty(r.stderr)}")
 
 
 def cmd_restart(_args):
@@ -777,7 +847,7 @@ def cmd_status(args):
     print(f"[{label(cfg, group_name)}] 실행 중 (pid {read_pid()})\n")
     listeners = listening_pids()
     enabled = enabled_names(group_name)
-    for t in get_group(cfg, group_name)["tunnels"]:
+    for t in filter(is_tunnel, get_group(cfg, group_name)["tunnels"]):
         s = status["tunnels"].get(t["name"], {})
         state = STATE_TEXT[tunnel_state(t, s, listeners) if t["name"] in enabled else "off"]
         print(f"  {state}  {t['name']:<22} 127.0.0.1:{t['local_port']:<6} → {target_of(t)}"
@@ -966,7 +1036,7 @@ class Supervisor:
             return
         self.config_error = None
         group = cfg["groups"].get(self.group_name, {"tunnels": []})
-        defs = {t["name"]: t for t in group["tunnels"]}
+        defs = {t["name"]: t for t in group["tunnels"] if is_tunnel(t)}
         desired = read_desired()
         want = set(desired["tunnels"]) if desired["group"] == self.group_name else set()
         want &= set(defs)
@@ -1022,27 +1092,25 @@ def push_eic_key(t, aws):
         raise TunnelError("send-ssh-public-key 실패: " + last_nonempty(r.stderr))
 
 
-def build_command(t, aws, interactive=False):
-    """터널 명령. interactive 면 포워딩 없이 경유 서버에 셸로 접속하는 ssh 명령 (eic·ssh·web)."""
+def build_command(t, aws):
+    """터널 명령. shell(SSH 접속)이면 포워딩 없이 셸로 접속하는 ssh 명령"""
+    login = t["type"] == "shell"
     password = t.get("auth") == "password"
-    ssh_opts = [
+    ssh_opts = [] if login else ["-N", "-o", "ExitOnForwardFailure=yes"]
+    ssh_opts += [
         "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
         "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
     ]
-    if interactive:
-        forward = []
-    else:
-        ssh_opts = ["-N", "-o", "ExitOnForwardFailure=yes"] + ssh_opts
-        forward = ["-L", f"127.0.0.1:{t['local_port']}:{remote_host_of(t)}:{t['remote_port']}"]
     if password:
         # 비밀번호는 SSH_ASKPASS 로 넘긴다 (build_env). 틀리면 한 번만 시도하고 끊는다.
         ssh_opts += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
                      "-o", "PreferredAuthentications=password,keyboard-interactive",
                      "-o", "NumberOfPasswordPrompts=1"]
-    elif not interactive:
+    elif not login:
         ssh_opts += ["-o", "BatchMode=yes"]
+    forward = [] if login else ["-L", f"127.0.0.1:{t['local_port']}:{remote_host_of(t)}:{t['remote_port']}"]
     if t["type"] == "eic":
         proxy = [aws, "ec2-instance-connect", "open-tunnel",
                  "--instance-id", t["instance_id"]] + aws_common(t)
@@ -1057,7 +1125,7 @@ def build_command(t, aws, interactive=False):
         return ["ssh"] + ssh_opts + identity + [
             "-p", str(t.get("ssh_port", 22)),
         ] + forward + [f"{t['user']}@{t['host']}"]
-    if t["type"] == "eic-direct" and not interactive:
+    if t["type"] == "eic-direct":
         return [aws, "ec2-instance-connect", "open-tunnel",
                 "--instance-connect-endpoint-id", t["eice_id"],
                 "--private-ip-address", t["private_ip"],
@@ -1269,11 +1337,15 @@ def main():
     s.add_argument("group")
     s.add_argument("name")
     s.set_defaults(func=cmd_open)
-    s = sub.add_parser("ssh", help="터널이 거쳐 가는 서버(배스천·SSH 서버)에 셸로 접속 (eic·ssh·web)")
+    s = sub.add_parser("ssh", help="SSH 접속 항목으로 접속 (ssh user@host)")
     s.add_argument("group")
     s.add_argument("name")
     s.add_argument("--window", action="store_true", help="새 터미널 창에서 열기")
+    s.add_argument("--terminal", help="--window 와 함께: 터미널 앱 (tunsw terminals 의 id)")
     s.set_defaults(func=cmd_ssh)
+    s = sub.add_parser("terminals", help="새 창을 열 수 있는 설치된 터미널 앱")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_terminals)
     sub.add_parser("restart", help="켜진 터널 전부 다시 연결").set_defaults(func=cmd_restart)
     s = sub.add_parser("status", help="연결 상태")
     s.add_argument("--json", action="store_true")

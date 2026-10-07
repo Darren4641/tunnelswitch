@@ -13,6 +13,12 @@ final class Store: ObservableObject {
     @Published var update: UpdateInfo?
     @Published var updating = false
     @Published var updateError: String?
+    /// SSH 접속을 열 수 있는 설치된 터미널 앱 (기본으로 고를 순서대로)
+    @Published var terminals: [TerminalApp] = []
+    /// 고른 터미널 앱 id. 처음에는 설치된 것 중 첫 번째 (iTerm2 등이 macOS 터미널보다 앞)
+    @Published var terminal = UserDefaults.standard.string(forKey: "terminal") ?? "" {
+        didSet { UserDefaults.standard.set(terminal, forKey: "terminal") }
+    }
 
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -26,6 +32,7 @@ final class Store: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        loadTerminals()
         checkForUpdate()
         updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.checkForUpdate() }
@@ -41,7 +48,7 @@ final class Store: ObservableObject {
     }
 
     var hasProblem: Bool {
-        runningGroup?.tunnels.contains { $0.state != "connected" } ?? false
+        runningGroup?.tunnels.contains { $0.enabled && $0.state != "connected" } ?? false
     }
 
     func refresh() {
@@ -97,9 +104,26 @@ final class Store: ObservableObject {
         perform(["open", group, name])
     }
 
-    /// 터널이 거쳐 가는 서버(배스천·SSH 서버)에 새 터미널 창에서 SSH 접속한다. 터널 상태는 그대로 둔다.
-    func openTerminal(_ name: String, in group: String) {
-        perform(["ssh", "--window", group, name])
+    /// SSH 접속 항목으로 고른 터미널 앱 새 창에서 접속한다.
+    func connect(_ name: String, in group: String) {
+        perform(["ssh", "--window", "--terminal", terminal, group, name])
+    }
+
+    var terminalName: String {
+        terminals.first { $0.id == terminal }?.name ?? "터미널"
+    }
+
+    private func loadTerminals() {
+        Task.detached {
+            let r = Engine.run(["terminals", "--json"])
+            let list = (try? JSONDecoder().decode([TerminalApp].self, from: Data(r.out.utf8))) ?? []
+            await MainActor.run {
+                self.terminals = list
+                if !list.contains(where: { $0.id == self.terminal }), let first = list.first {
+                    self.terminal = first.id
+                }
+            }
+        }
     }
 
     func beginEdit(_ draft: Draft) {
@@ -122,7 +146,7 @@ final class Store: ObservableObject {
     func delete(_ tunnel: Tunnel, in group: String) {
         let alert = NSAlert()
         alert.messageText = "'\(tunnel.config.name)' 터널을 삭제할까요?"
-        alert.informativeText = "127.0.0.1:\(tunnel.config.local_port) → \(tunnel.target)"
+        alert.informativeText = tunnel.config.local_port.map { "127.0.0.1:\($0) → \(tunnel.target)" } ?? tunnel.target
         alert.addButton(withTitle: "삭제")
         alert.addButton(withTitle: "취소")
         alert.buttons.first?.hasDestructiveAction = true

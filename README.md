@@ -26,7 +26,7 @@
 - 메뉴바에는 켜진 그룹 이름이 보이고, 아직 연결 안 된 터널이 있으면 아이콘이 ⚠︎ 로 바뀐다
 - 끊기면 ssh 가 마지막으로 남긴 메시지를 터널 아래에 보여 준다
 - 웹 서비스 터널은 "브라우저" 버튼을 누르면 터널을 켜고 연결될 때까지 기다렸다가 연다
-- "터미널" 버튼을 누르면 새 터미널 창에서 그 터널이 거쳐 가는 배스천·SSH 서버에 바로 SSH 접속한다
+- 터널 말고 SSH 접속(`ssh user@host`)도 등록해 두고 "접속" 버튼으로 터미널 새 창에서 바로 연다
 - 새 버전이 올라오면 업데이트할지 묻는다 ([업데이트](#업데이트))
 - 같은 기능을 터미널에서 `tunsw` 명령으로도 쓸 수 있다 ([CLI](#cli))
 
@@ -83,16 +83,18 @@ cd tunnelswitch
 | SSH(pem) → 배스천 | pem 키로 공인 배스천에 SSH → RDS 로 `-L` 포워딩 |
 | EIC 직접 | `aws ec2-instance-connect open-tunnel --private-ip-address` |
 | 웹 서비스 | SSH 서버에 접속 → 웹 서비스(기본 `127.0.0.1`, 즉 SSH 서버 자신)로 `-L` 포워딩. 브라우저로 `http(s)://localhost:<로컬 포트>` 를 연다 |
+| SSH 접속 | 터널이 아니라 `ssh user@host` 접속. 켜고 끄지 않고 "접속" 버튼으로 터미널 새 창에서 연다 |
 
-SSH(pem)·웹 서비스 방식은 **pem 키** 또는 **비밀번호**로 인증한다. 비밀번호는 `config.json`(권한 600)에
+SSH(pem)·웹 서비스·SSH 접속 방식은 **pem 키** 또는 **비밀번호**로 인증한다. 비밀번호는 `config.json`(권한 600)에
 저장되고, 연결할 때 `SSH_ASKPASS` 로 ssh 에 넘긴다 (OpenSSH 8.4 이상). 비밀번호가 틀리면 한 번만 시도하고 끊은 뒤
 백오프하며 다시 시도한다.
 
 웹 서비스 터널은 목록의 "브라우저" 버튼(또는 `tunsw open`)으로 연다. 꺼져 있으면 켜고 연결될 때까지 기다린 뒤 연다.
 
-EIC → 배스천, SSH(pem), 웹 서비스 터널은 "터미널" 버튼(또는 `tunsw ssh`)으로 경유 서버에 셸로 접속할 수 있다.
-터널과 같은 키·비밀번호·EIC 설정을 쓰고, 터널을 켜고 끄는 것과는 상관없다. 버튼은 기본 터미널 앱
-(`.command` 파일을 여는 앱, 보통 Terminal) 의 새 창에서 연다.
+SSH 접속은 목록의 "접속" 버튼(또는 `tunsw ssh`)으로 연다. 창 아래 "터미널" 메뉴에서 고른 앱의 새 창에서 열리고,
+지원하는 앱은 iTerm2, Ghostty, WezTerm, kitty, Alacritty, macOS 터미널이다. 처음에는 설치된 것 중
+이 순서로 첫 번째를 고르므로, 다른 터미널이 없으면 macOS 터미널로 연다. iTerm2 는 처음 열 때
+"TunnelSwitch 가 iTerm 을 제어하려고 합니다" 권한을 묻는다.
 
 EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 연결할 때마다
 `send-ssh-public-key` 로 배스천에 올린다. 필요한 권한은 `ec2-instance-connect:SendSSHPublicKey`,
@@ -115,7 +117,8 @@ EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 
 tunsw on  <group> [name ...]    # 켜기 (이름 생략 시 그룹 전체). 다른 그룹은 꺼짐
 tunsw off <group> [name ...]    # 끄기 (이름 생략 시 그룹 전체)
 tunsw open <group> <name>       # 웹 서비스 터널을 브라우저로 열기 (꺼져 있으면 켬)
-tunsw ssh  <group> <name>       # 터널이 거쳐 가는 배스천·SSH 서버에 셸로 접속 (--window: 새 터미널 창)
+tunsw ssh  <group> <name>       # SSH 접속 항목으로 접속 (--window [--terminal iterm]: 새 터미널 창)
+tunsw terminals                 # 새 창을 열 수 있는 설치된 터미널 앱
 tunsw status | stop | restart | logs -f
 tunsw update [--check]          # 새 버전 확인 / 받아서 다시 설치
 tunsw add | list | remove <group> <name> | edit

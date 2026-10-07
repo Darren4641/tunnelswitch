@@ -45,6 +45,7 @@ cat > "$STAGE/Contents/Info.plist" <<'PLIST'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>SSH 접속을 iTerm 새 창에서 열기 위해 사용합니다.</string>
 </dict>
 </plist>
 PLIST
