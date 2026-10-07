@@ -96,6 +96,9 @@ SSH 접속은 목록의 "접속" 버튼(또는 `tunsw ssh`)으로 연다. 창 �
 이 순서로 첫 번째를 고르므로, 다른 터미널이 없으면 macOS 터미널로 연다. iTerm2 는 처음 열 때
 "TunnelSwitch 가 iTerm 을 제어하려고 합니다" 권한을 묻는다.
 
+SSH 를 쓰는 방식(SSH(pem)·웹 서비스·SSH 접속)은 편집 창의 "연결 테스트" 버튼(또는 `tunsw test --json ...`)으로
+저장하기 전에 입력한 값으로 SSH 로그인이 되는지 확인할 수 있다. 로그인만 해 보고 바로 끊는다.
+
 EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 연결할 때마다
 `send-ssh-public-key` 로 배스천에 올린다. 필요한 권한은 `ec2-instance-connect:SendSSHPublicKey`,
 `ec2-instance-connect:OpenTunnel` 이고, EIC Endpoint ID 를 비워 두면 `ec2:DescribeInstanceConnectEndpoints` 도 필요하다.
@@ -119,6 +122,7 @@ tunsw off <group> [name ...]    # 끄기 (이름 생략 시 그룹 전체)
 tunsw open <group> <name>       # 웹 서비스 터널을 브라우저로 열기 (꺼져 있으면 켬)
 tunsw ssh  <group> <name>       # SSH 접속 항목으로 접속 (--window [--terminal iterm]: 새 터미널 창)
 tunsw terminals                 # 새 창을 열 수 있는 설치된 터미널 앱
+tunsw test --json '<JSON>'      # SSH 로그인 테스트 (add --json 과 같은 형식, 저장하지 않음)
 tunsw status | stop | restart | logs -f
 tunsw update [--check]          # 새 버전 확인 / 받아서 다시 설치
 tunsw add | list | remove <group> <name> | edit

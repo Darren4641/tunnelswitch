@@ -371,16 +371,21 @@ def validate_tunnel(t, others):
     return None
 
 
-def add_json(args):
-    cfg = load_config()
-    group = get_group(cfg, args.group)
+def parse_tunnel_json(text):
     try:
-        t = json.loads(args.json)
+        t = json.loads(text)
     except json.JSONDecodeError as e:
         die(f"JSON 오류: {e}")
     t = {k: v for k, v in t.items() if v not in (None, "")}
     if t.get("key"):
         t["key"] = str(Path(t["key"]).expanduser())
+    return t
+
+
+def add_json(args):
+    cfg = load_config()
+    group = get_group(cfg, args.group)
+    t = parse_tunnel_json(args.json)
     replace = args.replace
     if replace and not any(o["name"] == replace for o in group["tunnels"]):
         die(f"'{replace}' 터널이 없습니다.")
@@ -635,6 +640,45 @@ def cmd_ssh(args):
         ensure_askpass()
     print(f"{t['name']}: {target_of(t)} 접속 중…", file=sys.stderr)
     os.execvpe(cmd[0], cmd, build_env(t) or os.environ)
+
+
+def cmd_test(args):
+    """저장하지 않은 입력값(--json)으로 SSH 로그인만 해 보고 바로 끊는다 (ssh·web·shell).
+
+    터널(포워딩)은 만들지 않는다. 처음 보는 서버면 호스트 키를 known_hosts 에 등록한다.
+    """
+    t = parse_tunnel_json(args.json)
+    if t.get("type") not in SSH_TYPES:
+        die("연결 테스트는 SSH 로 접속하는 방식에서만 할 수 있습니다.")
+    missing = [f for f in ("host", "user") if not t.get(f)]
+    if missing:
+        die("필수 항목이 비었습니다: " + ", ".join(missing))
+    port = t.get("ssh_port", 22)
+    if not (isinstance(port, int) and 1 <= port <= 65535):
+        die("ssh_port 는 1~65535 사이 숫자여야 합니다.")
+    ensure_home()
+    password = t.get("auth") == "password"
+    if password:
+        if not t.get("password"):
+            die("SSH 비밀번호를 입력하세요.")
+        ensure_askpass()
+    else:
+        if not t.get("key"):
+            die("pem 키 경로를 입력하세요.")
+        if not Path(t["key"]).expanduser().is_file():
+            die(f"pem 키 파일이 없습니다: {t['key']}")
+    cmd = build_command({**t, "type": "shell"}, None)
+    # 앞에 둔 -o 가 우선한다. 키 인증은 비밀번호·패스프레이즈를 묻지 않고 실패하게 한다.
+    cmd[1:1] = ["-o", "ConnectTimeout=10"] + ([] if password else ["-o", "BatchMode=yes"])
+    cmd.append("exit")
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=30, env=build_env(t))
+    except subprocess.TimeoutExpired:
+        die("연결 시간 초과 (30초)")
+    if r.returncode != 0:
+        die("연결 실패: " + last_nonempty(r.stderr))
+    print(f"연결 성공: {target_of({**t, 'type': 'shell'})}")
 
 
 # 새 창에서 명령을 실행할 수 있는 터미널 앱. 앞에 있는 것일수록 기본으로 고른다 (macOS 터미널은 마지막).
@@ -1343,6 +1387,9 @@ def main():
     s.add_argument("--window", action="store_true", help="새 터미널 창에서 열기")
     s.add_argument("--terminal", help="--window 와 함께: 터미널 앱 (tunsw terminals 의 id)")
     s.set_defaults(func=cmd_ssh)
+    s = sub.add_parser("test", help="SSH 로그인 테스트 (저장하지 않은 입력값, ssh·web·shell)")
+    s.add_argument("--json", required=True, help="터널 정보 JSON (add --json 과 같은 형식)")
+    s.set_defaults(func=cmd_test)
     s = sub.add_parser("terminals", help="새 창을 열 수 있는 설치된 터미널 앱")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_terminals)

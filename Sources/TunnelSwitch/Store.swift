@@ -10,6 +10,9 @@ final class Store: ObservableObject {
     @Published var draft = Draft(group: "")
     @Published var formError: String?
     @Published var showEditor = false
+    /// 편집 폼의 연결 테스트: 진행 중 여부와 결과 (성공 여부, 메시지)
+    @Published var testing = false
+    @Published var testResult: (ok: Bool, message: String)?
     @Published var update: UpdateInfo?
     @Published var updating = false
     @Published var updateError: String?
@@ -129,7 +132,22 @@ final class Store: ObservableObject {
     func beginEdit(_ draft: Draft) {
         self.draft = draft
         formError = nil
+        testResult = nil
         showEditor = true
+    }
+
+    /// 편집 중인 값으로 SSH 로그인만 해 본다 (저장하지 않음).
+    func testConnection() {
+        testing = true
+        testResult = nil
+        let json = draft.json()
+        Task.detached {
+            let r = Engine.run(["test", "--json", json])
+            await MainActor.run {
+                self.testing = false
+                self.testResult = (r.code == 0, r.message)
+            }
+        }
     }
 
     func save() {

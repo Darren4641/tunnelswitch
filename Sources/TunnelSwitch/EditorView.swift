@@ -48,6 +48,20 @@ struct EditorView: View {
                         } else {
                             SecureField("비밀번호", text: d.password)
                         }
+                        HStack(alignment: .firstTextBaseline) {
+                            Button("연결 테스트") { store.testConnection() }
+                                .disabled(store.testing)
+                                .help("입력한 값으로 SSH 로그인만 해 보고 끊습니다 (저장하지 않음)")
+                            if store.testing {
+                                ProgressView().controlSize(.small)
+                            } else if let r = store.testResult {
+                                Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(r.ok ? .green : .red)
+                                    .lineLimit(3)
+                                    .textSelection(.enabled)
+                            }
+                        }
                     case .eicDirect:
                         TextField("EIC Endpoint ID", text: d.eiceId, prompt: Text("eice-0123456789abcdef0"))
                         TextField("AWS 프로파일", text: d.profile, prompt: Text("my-aws-profile"))
