@@ -22,7 +22,8 @@ enum Engine {
             .appendingPathComponent(".local/bin/tunsw").path
     }()
 
-    static func run(_ args: [String]) -> CommandResult {
+    /// started: 프로세스가 시작되면 불린다 (백그라운드 스레드). 취소할 때 terminate() 하려고 받아 둔다.
+    static func run(_ args: [String], started: ((Process) -> Void)? = nil) -> CommandResult {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["python3", path] + args
@@ -35,6 +36,7 @@ enum Engine {
         do { try p.run() } catch {
             return CommandResult(code: -1, out: "", err: "엔진 실행 실패: \(error.localizedDescription)")
         }
+        started?(p)
         let o = out.fileHandleForReading.readDataToEndOfFile()
         let e = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()

@@ -10,9 +10,15 @@ final class Store: ObservableObject {
     @Published var draft = Draft(group: "")
     @Published var formError: String?
     @Published var showEditor = false
-    /// 편집 폼의 연결 테스트: 진행 중 여부와 결과 (성공 여부, 메시지)
-    @Published var testing = false
+    /// 편집 폼의 연결 테스트: 진행 중이면 끝나는 시각, 끝나면 결과 (성공 여부, 메시지)
+    @Published var testDeadline: Date?
     @Published var testResult: (ok: Bool, message: String)?
+    var testing: Bool { testDeadline != nil }
+    /// 연결 테스트 전체 제한 시간(초). 엔진에 --timeout 으로 넘긴다.
+    let testTimeout = 30
+    private var testProcess: Process?
+    /// 취소했거나 새로 시작한 테스트의 늦게 온 결과를 버리기 위한 번호
+    private var testID = 0
     @Published var update: UpdateInfo?
     @Published var updating = false
     @Published var updateError: String?
@@ -132,22 +138,40 @@ final class Store: ObservableObject {
     func beginEdit(_ draft: Draft) {
         self.draft = draft
         formError = nil
+        cancelTest()
         testResult = nil
         showEditor = true
     }
 
     /// 편집 중인 값으로 SSH 로그인만 해 본다 (저장하지 않음).
     func testConnection() {
-        testing = true
+        cancelTest()
+        testID += 1
+        let id = testID
+        testDeadline = Date().addingTimeInterval(TimeInterval(testTimeout))
         testResult = nil
-        let json = draft.json()
+        let args = ["test", "--timeout", String(testTimeout), "--json", draft.json()]
         Task.detached {
-            let r = Engine.run(["test", "--json", json])
+            let r = Engine.run(args) { p in
+                Task { @MainActor in if self.testID == id { self.testProcess = p } }
+            }
             await MainActor.run {
-                self.testing = false
+                guard self.testID == id else { return }
+                self.testDeadline = nil
+                self.testProcess = nil
                 self.testResult = (r.code == 0, r.message)
             }
         }
+    }
+
+    /// 진행 중인 연결 테스트를 끊는다. 엔진이 SIGTERM 을 받으면 ssh 도 함께 종료한다.
+    func cancelTest(showResult: Bool = false) {
+        guard testing else { return }
+        testID += 1
+        testProcess?.terminate()
+        testProcess = nil
+        testDeadline = nil
+        if showResult { testResult = (false, "취소했습니다.") }
     }
 
     func save() {
@@ -157,6 +181,7 @@ final class Store: ObservableObject {
         let group = draft.group
         perform(args, onSuccess: {
             self.selected = group
+            self.cancelTest()
             self.showEditor = false
         }, onFailure: { self.formError = $0 })
     }

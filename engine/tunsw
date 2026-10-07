@@ -647,6 +647,8 @@ def cmd_test(args):
 
     터널(포워딩)은 만들지 않는다. 처음 보는 서버면 호스트 키를 known_hosts 에 등록한다.
     """
+    # 앱에서 취소하면 SIGTERM 이 온다. 예외로 바꿔야 subprocess.run 이 ssh 도 함께 종료한다.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit("취소했습니다."))
     t = parse_tunnel_json(args.json)
     if t.get("type") not in SSH_TYPES:
         die("연결 테스트는 SSH 로 접속하는 방식에서만 할 수 있습니다.")
@@ -669,13 +671,13 @@ def cmd_test(args):
             die(f"pem 키 파일이 없습니다: {t['key']}")
     cmd = build_command({**t, "type": "shell"}, None)
     # 앞에 둔 -o 가 우선한다. 키 인증은 비밀번호·패스프레이즈를 묻지 않고 실패하게 한다.
-    cmd[1:1] = ["-o", "ConnectTimeout=10"] + ([] if password else ["-o", "BatchMode=yes"])
+    cmd[1:1] = ["-o", f"ConnectTimeout={args.timeout}"] + ([] if password else ["-o", "BatchMode=yes"])
     cmd.append("exit")
     try:
         r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           timeout=30, env=build_env(t))
+                           timeout=args.timeout, env=build_env(t))
     except subprocess.TimeoutExpired:
-        die("연결 시간 초과 (30초)")
+        die(f"연결 시간 초과 ({args.timeout}초)")
     if r.returncode != 0:
         die("연결 실패: " + last_nonempty(r.stderr))
     print(f"연결 성공: {target_of({**t, 'type': 'shell'})}")
@@ -1389,6 +1391,7 @@ def main():
     s.set_defaults(func=cmd_ssh)
     s = sub.add_parser("test", help="SSH 로그인 테스트 (저장하지 않은 입력값, ssh·web·shell)")
     s.add_argument("--json", required=True, help="터널 정보 JSON (add --json 과 같은 형식)")
+    s.add_argument("--timeout", type=int, default=30, help="전체 제한 시간(초, 기본 30)")
     s.set_defaults(func=cmd_test)
     s = sub.add_parser("terminals", help="새 창을 열 수 있는 설치된 터미널 앱")
     s.add_argument("--json", action="store_true")

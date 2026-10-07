@@ -98,6 +98,7 @@ SSH 접속은 목록의 "접속" 버튼(또는 `tunsw ssh`)으로 연다. 창 �
 
 SSH 를 쓰는 방식(SSH(pem)·웹 서비스·SSH 접속)은 편집 창의 "연결 테스트" 버튼(또는 `tunsw test --json ...`)으로
 저장하기 전에 입력한 값으로 SSH 로그인이 되는지 확인할 수 있다. 로그인만 해 보고 바로 끊는다.
+최대 30초 기다리며 남은 시간을 막대로 보여 주고, "취소" 로 바로 끊을 수 있다.
 
 EIC 방식은 전용 SSH 키(`~/.config/tunnelswitch/eic_ed25519`)를 만들어 연결할 때마다
 `send-ssh-public-key` 로 배스천에 올린다. 필요한 권한은 `ec2-instance-connect:SendSSHPublicKey`,

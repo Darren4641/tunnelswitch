@@ -48,13 +48,16 @@ struct EditorView: View {
                         } else {
                             SecureField("비밀번호", text: d.password)
                         }
-                        HStack(alignment: .firstTextBaseline) {
-                            Button("연결 테스트") { store.testConnection() }
-                                .disabled(store.testing)
-                                .help("입력한 값으로 SSH 로그인만 해 보고 끊습니다 (저장하지 않음)")
-                            if store.testing {
-                                ProgressView().controlSize(.small)
-                            } else if let r = store.testResult {
+                        HStack(alignment: .center) {
+                            if let deadline = store.testDeadline {
+                                Button("취소") { store.cancelTest(showResult: true) }
+                                    .help("연결 테스트를 끊습니다")
+                                TestCountdown(deadline: deadline, total: store.testTimeout)
+                            } else {
+                                Button("연결 테스트") { store.testConnection() }
+                                    .help("입력한 값으로 SSH 로그인만 해 보고 끊습니다 (저장하지 않음)")
+                            }
+                            if !store.testing, let r = store.testResult {
                                 Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
                                     .font(.caption)
                                     .foregroundStyle(r.ok ? .green : .red)
@@ -117,7 +120,11 @@ struct EditorView: View {
 
             HStack {
                 Spacer()
-                Button("취소") { store.showEditor = false }.keyboardShortcut(.cancelAction)
+                Button("취소") {
+                    store.cancelTest()
+                    store.showEditor = false
+                }
+                .keyboardShortcut(.cancelAction)
                 Button(store.draft.original == nil ? "등록" : "저장") { store.save() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(store.busy)
@@ -125,6 +132,27 @@ struct EditorView: View {
             .padding([.horizontal, .bottom], 16)
         }
         .frame(width: 540, height: 600)
+    }
+
+    /// 연결 테스트 남은 시간: 줄어드는 막대와 초
+    private struct TestCountdown: View {
+        let deadline: Date
+        let total: Int
+
+        var body: some View {
+            TimelineView(.periodic(from: .now, by: 0.2)) { ctx in
+                let left = max(0, deadline.timeIntervalSince(ctx.date))
+                HStack(spacing: 8) {
+                    ProgressView(value: left, total: Double(total))
+                        .progressViewStyle(.linear)
+                        .tint(left < 5 ? .red : .accentColor)
+                        .frame(width: 140)
+                    Text("연결 중… \(Int(left.rounded(.up)))초")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     private var isEnabled: Bool {
